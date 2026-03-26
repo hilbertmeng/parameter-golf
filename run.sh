@@ -1,0 +1,3 @@
+NCCL_NET=Socket NCCL_DEBUG=WARN DATA_PATH=./data/datasets/fineweb10B_sp1024/ TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model VOCAB_SIZE=1024 RUN_ID=baseline0323_2m ITERATIONS=4000 WARMDOWN_ITERS=700 MUON_MOMENTUM_WARMUP_STEPS=300 MAX_WALLCLOCK_SECONDS=0 VAL_LOSS_EVERY=1000 torchrun --standalone --nproc_per_node=2 train_gpt_mqy.py
+
+#TODO GRAD_CLIP_NORM=0.3 ? 
