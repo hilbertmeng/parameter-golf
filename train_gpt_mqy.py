@@ -24,6 +24,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -98,6 +99,7 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    tensorboard_dir = os.environ.get("TENSORBOARD_DIR", "")
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1410,9 +1412,13 @@ def main() -> None:
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
     logfile = None
+    tb_writer: SummaryWriter | None = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
+        tb_dir = args.tensorboard_dir or f"logs/tensorboard/{args.run_id}"
+        os.makedirs(tb_dir, exist_ok=True)
+        tb_writer = SummaryWriter(log_dir=tb_dir)
         print(logfile)
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
@@ -1693,7 +1699,7 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
         if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            raw_grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         # === 3-phase overlapped optimizer step ===
         # Phase 1: Launch async reduce-scatter for banks (biggest first)
         optimizer_muon.launch_reduce_scatters()
@@ -1714,6 +1720,11 @@ def main() -> None:
             for name, t in base_model.state_dict().items():
                 ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
+        if tb_writer is not None:
+            current_lr = optimizer_muon.param_groups[0]["lr"]
+            tb_writer.add_scalar("train/learning_rate", float(current_lr), step)
+            tb_writer.add_scalar("train/loss", float(train_loss.item()), step)
+            tb_writer.add_scalar("train/raw_grad_norm", float(raw_grad_norm), step)
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
             if swa_state is None:
@@ -1892,6 +1903,8 @@ def main() -> None:
         log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
              f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
         log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+    if tb_writer is not None:
+        tb_writer.close()
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
