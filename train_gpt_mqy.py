@@ -97,6 +97,7 @@ class Hyperparameters:
     mudd_k_dilation = int(os.environ.get("MUDD_K_DILATION", "1"))
     mudd_prenorm = bool(int(os.environ.get("MUDD_PRENORM", "0")))
     multiway = bool(int(os.environ.get("MULTIWAY", "0")))
+    use_kv_shift = bool(int(os.environ.get("USE_KV_SHIFT", "0")))
     profile = bool(int(os.environ.get("PROFILE", "0")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
@@ -618,6 +619,7 @@ class CausalSelfAttention(nn.Module):
         qk_gain_init: float,
         gated_attention: bool = False,
         value_residual: bool = False,
+        use_kv_shift: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -643,6 +645,10 @@ class CausalSelfAttention(nn.Module):
         self.value_residual = value_residual
         if value_residual:
             self.vr_lambda = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
+        self.use_kv_shift = use_kv_shift
+        if use_kv_shift:
+            self.kv_shift = CastedLinear(dim, num_kv_heads * 2, bias=False)
+            nn.init.zeros_(self.kv_shift.weight)
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         """Efficient XSA: subtract self-value projection via GQA-aware reshape (no repeat_interleave).
         y: [B, T, H, D], v: [B, T, Hkv, D]. H must be divisible by Hkv."""
@@ -671,6 +677,13 @@ class CausalSelfAttention(nn.Module):
             v = v + v_embed
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         raw_v = v if self.value_residual else None
+
+        if self.use_kv_shift:
+            kg, vg = torch.sigmoid(self.kv_shift(xq)).reshape(bsz, seqlen, self.num_kv_heads, 2).chunk(2, dim=-1)
+            k_prev = torch.cat([k[:, :1], k[:, :-1]], dim=1)
+            v_prev = torch.cat([v[:, :1], v[:, :-1]], dim=1)
+            k = k*kg + (1-kg)*k_prev
+            v = v*vg + (1-vg)*v_prev
         if self.value_residual and v0 is not None:
             lam = self.vr_lambda.to(dtype=v.dtype)
             v = lam[0] * v0 + lam[1] * v
@@ -807,12 +820,13 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        use_kv_shift: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                        gated_attention=gated_attention, value_residual=value_residual)
+                                        gated_attention=gated_attention, value_residual=value_residual, use_kv_shift=use_kv_shift)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -876,6 +890,7 @@ class GPT(nn.Module):
         mudd_q_dilation: int = 1,
         mudd_k_dilation: int = 1,
         mudd_prenorm: bool = False,
+        use_kv_shift: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -887,6 +902,7 @@ class GPT(nn.Module):
         self.value_residual = value_residual
         self.use_mudd = use_mudd
         self.multiway = multiway
+        self.use_kv_shift = use_kv_shift
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
@@ -919,6 +935,7 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    use_kv_shift=use_kv_shift,
                 )
                 for i in range(num_layers)
             ]
@@ -1007,6 +1024,8 @@ class GPT(nn.Module):
                     nn.init.zeros_(module.weight)
                 elif 'dynamic_dense' in name:
                     nn.init.normal_(module.weight, mean=0.0, std=0.006)
+                elif 'kv_shift' in name:
+                    pass
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
@@ -1652,6 +1671,7 @@ def main() -> None:
         mudd_q_dilation=args.mudd_q_dilation,
         mudd_k_dilation=args.mudd_k_dilation,
         mudd_prenorm=args.mudd_prenorm,
+        use_kv_shift=args.use_kv_shift,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1697,6 +1717,12 @@ def main() -> None:
         if block is not None:
             mudd_scalar_params.extend([p for p in block.parameters() if p.ndim < 2 ])
             mudd_matrix_params.extend([p for p in block.parameters() if p.ndim == 2 ])
+    if base_model.use_kv_shift:
+        kv_shift_params = []
+        for block in base_model.blocks:
+            if block.attn.use_kv_shift:
+                kv_shift_params.extend([block.attn.kv_shift.weight])
+        scalar_params.extend(kv_shift_params)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
@@ -2055,6 +2081,7 @@ def main() -> None:
         mudd_k_dilation=args.mudd_k_dilation,
         multiway=args.multiway,
         mudd_prenorm=args.mudd_prenorm,
+        use_kv_shift=args.use_kv_shift,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
