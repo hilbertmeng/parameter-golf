@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
+from einops import rearrange
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -91,6 +92,12 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
+    use_mudd = bool(int(os.environ.get("USE_MUDD", "0")))
+    mudd_q_dilation = int(os.environ.get("MUDD_Q_DILATION", "1"))
+    mudd_k_dilation = int(os.environ.get("MUDD_K_DILATION", "1"))
+    mudd_prenorm = bool(int(os.environ.get("MUDD_PRENORM", "0")))
+    multiway = bool(int(os.environ.get("MULTIWAY", "0")))
+    profile = bool(int(os.environ.get("PROFILE", "0")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
@@ -647,10 +654,19 @@ class CausalSelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
     def forward(self, x: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
-        bsz, seqlen, dim = x.shape
-        q = F.linear(x, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        k = F.linear(x, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = F.linear(x, v_w.to(x.dtype))
+        if isinstance(x, tuple):
+            if len(x) == 3:
+                xq, xk, xv = x
+            elif len(x) == 2: # qk share one way
+                xq, xv = x
+                xk = xq
+            bsz, seqlen, dim = xq.shape
+        else:
+            bsz, seqlen, dim = x.shape
+            xq, xk, xv = x, x, x
+        q = F.linear(xq, q_w.to(xq.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = F.linear(xk, k_w.to(xk.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = F.linear(xv, v_w.to(xv.dtype))
         if v_embed is not None:
             v = v + v_embed
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -660,7 +676,7 @@ class CausalSelfAttention(nn.Module):
             v = lam[0] * v0 + lam[1] * v
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        cos, sin = self.rotary(seqlen, xq.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
@@ -672,7 +688,7 @@ class CausalSelfAttention(nn.Module):
             gate = torch.sigmoid(self.attn_gate(x)).unsqueeze(-1)
             y = y * gate
         y = y.reshape(bsz, seqlen, dim)
-        return F.linear(y, out_w.to(x.dtype)), raw_v
+        return F.linear(y, out_w.to(xq.dtype)), raw_v
 
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
@@ -723,6 +739,52 @@ class ValueEmbedding(nn.Module):
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
 
+class MultiwayDynamicDenseBlock(nn.Module):
+    def __init__(self, dim: int, lidx: int, last_layer=False, multiway=False, q_dilation=1, k_dilation=1, base_layer=1, mudd_in_channels=None, num_ways=4, local_window_size=None) -> None:
+        super().__init__()
+        self.norm = RMSNorm()
+        # self.C = 4 if not last_layer else 1
+        if multiway:
+            self.C = num_ways if not last_layer else 1
+        else:
+            self.C = 1 
+        self.lidx = lidx
+        if local_window_size is None:
+            l = base_layer + (lidx + 1) // k_dilation
+        else:
+            l = local_window_size
+        self.local_window_size = local_window_size
+        hid_dim, out_dim = l * self.C, l * self.C
+        self.dim = dim
+        self.mudd_in_channels = mudd_in_channels or dim
+        self.w1 = CastedLinear(self.mudd_in_channels, hid_dim, bias=False)
+        self.act = nn.GELU() 
+        self.w2 = CastedLinear(hid_dim, out_dim, bias=True)
+        self.w2._zero_init = True
+        self.w2.bias.data.fill_(0.0)
+        self.channels = dim // 1
+        self.scale = nn.Parameter(torch.ones(self.channels * self.C, dtype=torch.float32)*0.1)
+    
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.norm(x[:,:,:self.mudd_in_channels]) 
+        dw = self.w2(self.act(self.w1(x))) # BTD->BTL
+        dw = rearrange(dw, 'B T (C L) -> C B T L', C=self.C)
+        return dw
+    
+    def layer_mix(self, x, all_hids, dw) -> Tensor:
+        L = dw.shape[3]
+        hids = all_hids[-L:]
+        channels = self.channels
+        scale = self.scale.to(dtype=hids[0].dtype).view(self.C, 1, 1, -1)
+        norm = lambda x:x 
+
+        weighted = dw[:, :, :, 0, None] * norm(hids[0][:, :, :channels]) # CBT1, BTD -> CBTD
+        for j in range(1, L):
+            weighted = weighted + dw[:, :, :, j, None] * norm(hids[j][:, :, :channels])
+        normed = F.rms_norm(weighted, (weighted.size(-1),)) * scale # CBTD, C11D -> CBTD
+        result = x + F.pad(normed, (0, hids[-1].size(-1) - channels))
+        return tuple(result[c] for c in range(self.C)) if self.C > 1 else result[0]
+
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
@@ -763,9 +825,18 @@ class Block(nn.Module):
         else:
             self.dtg_gate = None
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
+        if x0 is not None:
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+            normed_x = self.attn_norm(x_in) * self.ln_scale_factor
+        else:
+            if isinstance(x, tuple):
+                x_in = x[-1]
+                normed_x = tuple([self.attn_norm(x_i) * self.ln_scale_factor for x_i in x[:-1]])
+            else:
+                x_in = x
+                normed_x = self.attn_norm(x_in) * self.ln_scale_factor
+        attn_out, raw_v = self.attn(normed_x, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         if self.dtg_gate is not None:
@@ -800,6 +871,11 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        use_mudd: bool = False,
+        multiway: bool = False,
+        mudd_q_dilation: int = 1,
+        mudd_k_dilation: int = 1,
+        mudd_prenorm: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -809,6 +885,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.value_residual = value_residual
+        self.use_mudd = use_mudd
+        self.multiway = multiway
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
@@ -851,7 +929,7 @@ class GPT(nn.Module):
                 block.attn.rope_dims = rope_dims
                 block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
         self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
-        kv_dim_ve = self._ve_target_dim
+        kv_dim_ve = self._ve_target_dim #if not use_mudd else model_dim
         if self.ve_layer_indices:
             self.ve_shared = ValueEmbedding(vocab_size, ve_dim, kv_dim_ve)
             self.ve_layer_scales = nn.ParameterList(
@@ -861,7 +939,31 @@ class GPT(nn.Module):
             self.ve_shared = None
             self.ve_layer_scales = nn.ParameterList()
         self.value_embeds = nn.ModuleList()  # keep empty for compat
+        if use_mudd:
+            self.mudd_q_dilation = mudd_q_dilation # q_dilation for mudd
+            self.mudd_k_dilation = mudd_k_dilation # k_dilation for mudd
+            self.mudd_bigrams = False
+            self.mudd_embeds = False
+            self.num_ways = [4] * num_layers
+            # multiway_dilation = 4 
+            # self.num_ways = [ 4 if i % multiway_dilation ==0 else 1 for i in range(num_layers)]
+            self.mudd_in_channels = model_dim
+
+            local_window_sizes = [None] * num_layers
+            # local_window_sizes = [2, None, None, None] * 3
+            num_base_layers = 1 
+            if self.mudd_bigrams:
+                num_base_layers += 1
+            if self.mudd_embeds:
+                num_base_layers += 1
+            self.dynamic_dense = nn.ModuleList([MultiwayDynamicDenseBlock(model_dim, i, last_layer=i==num_layers-1, multiway=multiway, q_dilation=self.mudd_q_dilation, k_dilation=self.mudd_k_dilation, base_layer=num_base_layers, mudd_in_channels=self.mudd_in_channels, num_ways=self.num_ways[i], local_window_size=local_window_sizes[i]) if i % self.mudd_q_dilation == 0 or i == num_layers-1 else None for i in range(num_layers) ])
+        else:
+            self.dynamic_dense = nn.ModuleList()
         self.final_norm = RMSNorm()
+        if mudd_prenorm:
+            self.mudd_prenorm = RMSNorm() 
+        else:
+            self.mudd_prenorm = lambda x: x
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -890,11 +992,21 @@ class GPT(nn.Module):
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
             self.qo_bank.data[n + i].mul_(proj_scale)
             self.mlp_down_bank.data[i].mul_(proj_scale)
+
+        # nn.init.normal_(self.qo_bank.data, mean=0.0, std=0.006)
+        # nn.init.normal_(self.kv_bank.data, mean=0.0, std=0.006)
+        # nn.init.normal_(self.mlp_down_bank.data, mean=0.0, std=0.006)
+        # nn.init.normal_(self.mlp_up_bank.data, mean=0.0, std=0.006)
+
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
+        print("Initializing remaining nn.Linear modules")
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
+                print(name, module.weight.shape)
                 if getattr(module, "_zero_init", False):
                     nn.init.zeros_(module.weight)
+                elif 'dynamic_dense' in name:
+                    nn.init.normal_(module.weight, mean=0.0, std=0.006)
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
@@ -907,34 +1019,84 @@ class GPT(nn.Module):
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        disable_unet = True
+        disable_x0 = True 
+        disable_v0 = True
+        
+        disable_bigram = False #if not (self.use_mudd and self.mudd_bigrams) else True
+        disable_smear = False
+        disable_ve = False if not (self.use_mudd and self.mudd_embeds) else True
+        
+        hiddens = []
         n = self.num_layers
         x = self.tok_emb(input_ids)
-        if self.bigram is not None:
-            x = x + self.bigram(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x = self.smear(x)
+        # hiddens.append(x)
+        if not disable_bigram:
+            if self.bigram is not None:
+                bigrams = self.bigram(input_ids)
+                if self.use_mudd and self.mudd_bigrams:
+                    hiddens.append(F.rms_norm(x + bigrams, (x.size(-1),) ))
+                else:
+                    x = x + bigrams
+                    x = F.rms_norm(x, (x.size(-1),))
+        if not disable_smear:
+            x = self.smear(x)
+        if self.use_mudd and self.mudd_embeds:
+            me = self.ve_shared(input_ids)
+            hiddens.append(self.mudd_prenorm(me))
         x0 = x
         v0 = None
+        if self.use_mudd:
+            hiddens.append(self.mudd_prenorm(x))
         skips: list[Tensor] = []
+        if disable_x0:
+            x0 = None
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
+            if not disable_ve:
+                ve = self._get_ve(i, input_ids, ve_cache)
+            else:
+                ve = None
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
-            if v0 is None and raw_v is not None:
+            if not disable_v0 and v0 is None and raw_v is not None:
                 v0 = raw_v
-            skips.append(x)
+            if self.use_mudd:
+                if i % self.mudd_k_dilation == 0:
+                    hiddens.append(self.mudd_prenorm(x))
+                if i % self.mudd_q_dilation == 0:
+                    dw = self.dynamic_dense[i](x)
+                    mixed = self.dynamic_dense[i].layer_mix(x, hiddens, dw)
+                    if self.multiway:
+                        x = mixed
+                    else:
+                        x = mixed[0]
+            if not disable_unet:
+                skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
+            if not disable_ve:
+                ve = self._get_ve(bi, input_ids, ve_cache)
+            else:
+                ve = None
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
+            if self.use_mudd:
+                if bi % self.mudd_k_dilation == 0:  
+                    hiddens.append(self.mudd_prenorm(x))
+                if bi % self.mudd_q_dilation == 0 or bi == self.num_layers-1:
+                    dw = self.dynamic_dense[bi](x)
+                    mixed = self.dynamic_dense[bi].layer_mix(x, hiddens, dw)
+                    if self.multiway:
+                        x = mixed
+                    else:
+                        x = mixed[0]
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1485,6 +1647,11 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        use_mudd=args.use_mudd,
+        multiway=args.multiway,
+        mudd_q_dilation=args.mudd_q_dilation,
+        mudd_k_dilation=args.mudd_k_dilation,
+        mudd_prenorm=args.mudd_prenorm,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1499,6 +1666,15 @@ def main() -> None:
     # and non-bank grads are manually all-reduced before Adam steps.
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = compiled_model
+    # model = base_model
+
+    if rank == 0:
+        print('model parameters:')
+        for k, v in model.named_parameters():
+            print(k, v.shape, v.mean().item(), v.std().item())
+        for block in base_model.dynamic_dense:
+            if block is not None:
+                print('lidx', block.lidx, 'num_ways', block.C, 'local_window_size', block.local_window_size)
 
     # Optimizer split:
     # - 4 parameter banks -> Muon (batched Newton-Schulz)
@@ -1515,6 +1691,12 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    mudd_scalar_params: list[torch.nn.Parameter] = []
+    mudd_matrix_params: list[torch.nn.Parameter] = []
+    for block in base_model.dynamic_dense:
+        if block is not None:
+            mudd_scalar_params.extend([p for p in block.parameters() if p.ndim < 2 ])
+            mudd_matrix_params.extend([p for p in block.parameters() if p.ndim == 2 ])
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
@@ -1533,6 +1715,8 @@ def main() -> None:
         scalar_params.append(base_model.ve_shared.scale)
         for s in base_model.ve_layer_scales:
             scalar_params.append(s)
+    scalar_params.extend(mudd_scalar_params + mudd_matrix_params)
+    # matrix_params.extend(mudd_matrix_params)
     optimizer_tok = torch.optim.AdamW(
         tok_params,
         betas=(args.beta1, args.beta2),
@@ -1594,6 +1778,8 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"use_mudd:{args.use_mudd}")
+    log0(f"multiway:{args.multiway}")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1604,6 +1790,9 @@ def main() -> None:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+            # warmup_start = args.iterations * 0.01 
+            # if step < warmup_start:
+            #     return (step+1) / warmup_start
             return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
@@ -1646,9 +1835,19 @@ def main() -> None:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
+    _prof_ctx = None
+    if args.profile and rank == 0:
+        _prof_ctx = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=5, warmup=2, active=3, repeat=1),
+            record_shapes=True,
+            with_stack=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("./profile_traces"),
+        )
+        _prof_ctx.__enter__()
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        should_validate = last_step or (args.val_loss_every > 0 and step>0 and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
@@ -1664,10 +1863,14 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            step_avg_ms = training_time_ms / max(step, 1)
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{step_avg_ms:.2f}ms"
             )
+            if tb_writer is not None:
+                tb_writer.add_scalar("val/loss", float(val_loss), step)
+                tb_writer.add_scalar("val/bpb", float(val_bpb), step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
         if last_step:
@@ -1698,6 +1901,9 @@ def main() -> None:
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        # if rank == 0:
+        #     for name, param in base_model.named_parameters():
+        #         print(step, name, param.shape, param.grad.norm().mean().item() if param.grad is not None else 0)
         if args.grad_clip_norm > 0:
             raw_grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         # === 3-phase overlapped optimizer step ===
@@ -1720,6 +1926,14 @@ def main() -> None:
             for name, t in base_model.state_dict().items():
                 ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
+        if _prof_ctx is not None:
+            _prof_ctx.step()
+            if step == 11:
+                _prof_ctx.__exit__(None, None, None)
+                log0("Profiler trace saved to ./profile_traces/")
+                log0(_prof_ctx.key_averages(group_by_stack_n=5).table(sort_by="cuda_time_total", row_limit=50))
+                log0(_prof_ctx.key_averages().table(sort_by="cuda_time_total", row_limit=50))
+                _prof_ctx = None
         if tb_writer is not None:
             current_lr = optimizer_muon.param_groups[0]["lr"]
             tb_writer.add_scalar("train/learning_rate", float(current_lr), step)
@@ -1742,10 +1956,13 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            step_avg_ms = approx_training_time_ms / max(step, 1)
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{step_avg_ms:.2f}ms raw_grad_norm:{raw_grad_norm:.4f}, scale:{scale:.4f}"
             )
+            if tb_writer is not None:
+                tb_writer.add_scalar("perf/step_avg_ms", float(step_avg_ms), step)
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
@@ -1833,6 +2050,11 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        use_mudd=args.use_mudd,
+        mudd_q_dilation=args.mudd_q_dilation,
+        mudd_k_dilation=args.mudd_k_dilation,
+        multiway=args.multiway,
+        mudd_prenorm=args.mudd_prenorm,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
@@ -1857,6 +2079,8 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    print('exit early to debug')
+    exit()
     sw_seq_len = effective_eval_seq_len
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
