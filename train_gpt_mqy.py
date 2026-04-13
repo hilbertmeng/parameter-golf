@@ -29,6 +29,8 @@ from einops import rearrange
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 from typing import Optional, Tuple  
 
+torch._inductor.config.force_disable_caches = True
+
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -111,6 +113,7 @@ class Hyperparameters:
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     tensorboard_dir = os.environ.get("TENSORBOARD_DIR", "")
+    checkpoint_every = int(os.environ.get("CHECKPOINT_EVERY", "0"))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -569,6 +572,20 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
+
+# def unique_param_list(params: list[nn.Parameter]) -> list[nn.Parameter]:
+#     """Preserve order; drop duplicates (same Parameter must not appear twice in one optimizer)."""
+#     seen: set[int] = set()
+#     out: list[nn.Parameter] = []
+#     for p in params:
+#         pid = id(p)
+#         if pid not in seen:
+#             seen.add(pid)
+#             out.append(p)
+#         else:
+#             print(f"duplicate parameter found: {p.name}")
+#     return out
+
 class Rotary(nn.Module):
     def __init__(self, dim: int, base: float = 10000.0, train_seq_len: int = 1024, rope_dims: int = 0):
         super().__init__()
@@ -627,17 +644,27 @@ def _atten_context(query, key, value, atten_mask, pre_proj_dw_args, post_proj_dw
     o = probs @ value  # BNTS,BNSD->BNTD
     return o
 
-def _cross_head_proj(inputs, sw, qw1, qw2, kw1, kw2, qdd, kdd, loop_over_dynamic_hd=False):
+def _cross_head_proj(inputs, sw, qw1, qw2, kw1, kw2, qdd, kdd, loop_over_dynamic_hd=True):
     out = inputs + torch.einsum('BNTS,NM->BMTS', inputs, sw) if sw is not None else inputs
-    for i in range(2):
-        qhidden = (inputs * qw1[..., i, :].transpose(-2, -1).unsqueeze(-1)).sum(1)  # BNTS,(BTN->BNT->BNT1)->BNTS->BTS
-        qout = qhidden.unsqueeze(1) * qw2[..., i, :].transpose(-2, -1).unsqueeze(-1) # (BTS->B1TS),(BTN->BNT->BNT1)->BNTS
-        out = out + qout
-        khidden = (inputs * kw1[..., i, :].transpose(-2, -1).unsqueeze(-2)).sum(1)  # BNTS,(BSN->BNS->BN1S)->BNTS->BTS
-        kout = khidden.unsqueeze(1) * kw2[..., i, :].transpose(-2, -1).unsqueeze(-2) # (BTS->B1TS),(BSN->BNS->BNS1)->BNTS
-        out = out + kout
-    qdout = inputs * qdd.transpose(-2, -1).unsqueeze(-1); out = out + qdout  # BNTS,(BTN->BNT->BNT1)->BNTS
-    kdout = inputs * kdd.transpose(-2, -1).unsqueeze(-2); out = out + kdout  # BNTS,(BSN->BNS->BN1S)->BNTS
+    if loop_over_dynamic_hd:
+        for i in range(2):
+            if qw1 is not None:
+                qhidden = (inputs * qw1[..., i, :].transpose(-2, -1).unsqueeze(-1)).sum(1)  # BNTS,(BTN->BNT->BNT1)->BNTS->BTS
+                qout = qhidden.unsqueeze(1) * qw2[..., i, :].transpose(-2, -1).unsqueeze(-1) # (BTS->B1TS),(BTN->BNT->BNT1)->BNTS
+                out = out + qout
+            if kw1 is not None:
+                khidden = (inputs * kw1[..., i, :].transpose(-2, -1).unsqueeze(-2)).sum(1)  # BNTS,(BSN->BNS->BN1S)->BNTS->BTS
+                kout = khidden.unsqueeze(1) * kw2[..., i, :].transpose(-2, -1).unsqueeze(-2) # (BTS->B1TS),(BSN->BNS->BNS1)->BNTS
+                out = out + kout
+        if qdd is not None:
+            qdout = inputs * qdd.transpose(-2, -1).unsqueeze(-1); out = out + qdout  # BNTS,(BTN->BNT->BNT1)->BNTS
+        if kdd is not None:
+            kdout = inputs * kdd.transpose(-2, -1).unsqueeze(-2); out = out + kdout  # BNTS,(BSN->BNS->BN1S)->BNTS
+    else:
+        x_inter = torch.einsum('BNTS, BTIN->BTSI', inputs, qw1)
+        qw_out = torch.einsum('BTSI, BTIN->BNTS', x_inter, qw2)
+        out = out + qw_out
+        out = out + torch.einsum('BNTS, BTN->BNTS', inputs, qdd)
     return out
 
 def slice_dw(sw, qw1, qw2, kw1, kw2, qdd, kdd, start, stop, kv_start):
@@ -679,8 +706,10 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.attn_window_size = attn_window_size
         self.use_dcmha = use_dcmha
+        self._cached_window_mask: Tensor | None = None
         if self.use_dcmha:
-            self.dyn_w_proj = DynamicWeightProjection(dim, num_heads=self.num_heads, query_input_dim=dim, dynamic_squeeze_ratio=self.num_heads//2, dynamic_w_hidden_dim=self.num_heads*4, dtype=torch.bfloat16, use_sw=False)
+            n_splits = 4
+            self.dyn_w_proj = DynamicWeightProjection(dim, num_heads=self.num_heads, query_input_dim=dim, dynamic_squeeze_ratio=self.num_heads//2, dynamic_w_hidden_dim=self.num_heads*n_splits, n_splits=n_splits, dtype=torch.bfloat16, use_sw=False)
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         # No CastedLinear -- weights come from banks
@@ -755,12 +784,17 @@ class CausalSelfAttention(nn.Module):
             q = rearrange(q, 'b s h d -> b h s d')
             k = rearrange(k, 'b s h d -> b h s d')
             v = rearrange(v, 'b s h d -> b h s d')
-            mask = make_window_mask(seqlen, self.attn_window_size)
-            mask = mask.to(q.device)
+            if self._cached_window_mask is None or self._cached_window_mask.shape[-1] != seqlen:
+                self._cached_window_mask = make_window_mask(seqlen, self.attn_window_size).to(q.device)
+            mask = self._cached_window_mask
 
             project_logits = True
             project_probs = True
             pre_proj_dw_args, post_proj_dw_args, _ = self.dyn_w_proj(xq)
+            # fake_dw = torch.ones(bsz, seqlen, 2, self.num_heads, dtype=q.dtype, device=q.device)
+            # fake_dd = torch.ones(bsz, seqlen, self.num_heads, dtype=q.dtype, device=q.device)
+            # pre_proj_dw_args = (fake_dw, fake_dw, None, None, fake_dd, None)
+            # post_proj_dw_args = (fake_dw, fake_dw, None, None, fake_dd, None)
             (pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd) = pre_proj_dw_args  # BTGIM
             (post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd) = post_proj_dw_args
             pre_sw, post_sw = None, None
@@ -768,8 +802,9 @@ class CausalSelfAttention(nn.Module):
             y = torch.zeros(bsz, self.num_heads, seqlen, self.head_dim).to(q.device, dtype=q.dtype)
             window_size = seqlen if self.attn_window_size is None else self.attn_window_size
             q = q * self.head_dim ** -0.5
-            q_chunk_size = 256
-            for i in range(seqlen // q_chunk_size + 1):
+            q_chunk_size = 128 # 128
+            chunk_num = seqlen // q_chunk_size if seqlen % q_chunk_size == 0 else seqlen // q_chunk_size + 1
+            for i in range(chunk_num):
                 start, stop = i * q_chunk_size, (i + 1) * q_chunk_size
                 stop = min(stop, seqlen)
                 kv_start = max(0, stop - q_chunk_size - window_size) 
@@ -890,7 +925,7 @@ class CrossHeadProjection(nn.Module):
 
 class DynamicWeightProjection(nn.Module):
     
-    def __init__(self, dim, num_heads=32, num_groups=1, residual=True, query_input_dim=4096, dynamic_squeeze_ratio=16, dynamic_w_hidden_dim=128,dtype=torch.bfloat16,use_sw=False):
+    def __init__(self, dim, num_heads=32, num_groups=1, residual=True, query_input_dim=4096, dynamic_squeeze_ratio=16, dynamic_w_hidden_dim=128,n_splits=4, dtype=torch.bfloat16,use_sw=False):
         super().__init__()
         self.num_heads = num_heads 
         self.num_groups = num_groups 
@@ -904,6 +939,7 @@ class DynamicWeightProjection(nn.Module):
         self.use_sw = use_sw
         self.pre_proj = CrossHeadProjection('pre', num_heads=self.num_heads, use_sw=use_sw, dtype=dtype)
         self.post_proj = CrossHeadProjection('post', num_heads=self.num_heads, use_sw=use_sw, dtype=dtype)
+        self.n_splits = n_splits
 
         dynamic_hidden_dim = self.num_heads_per_group // self.dynamic_squeeze_ratio 
         self.dynamic_hidden_dim = dynamic_hidden_dim 
@@ -912,12 +948,22 @@ class DynamicWeightProjection(nn.Module):
         qkw_std = 0.02 / (math.sqrt(2*self.num_heads*rank) * (self.num_heads + rank))
         dd_std = 0.05 * math.sqrt(2/(self.num_heads + dim)) 
         dw1_std = math.sqrt(2/(dim+self.dynamic_w_hidden_dim))
+        C = n_splits
 
-        self.dw1 = nn.parameter.Parameter(torch.zeros(self.query_input_dim, self.num_groups, 4, self.dynamic_w_hidden_dim, dtype=dtype).normal_(mean=0,std=dw1_std)) #(4096, 1, 4, 128)
-        G, K, M = self.num_groups, self.dynamic_w_hidden_dim, self.num_heads_per_group
-        I = dynamic_hidden_dim * 2 
-        self.qkw = nn.parameter.Parameter(torch.zeros([G, 4, K, I, M], dtype=dtype).normal_(mean=0,std=qkw_std)) # (1, 4, 128, 4, 32)
-        self.dd = nn.parameter.Parameter(torch.zeros(self.query_input_dim, self.num_groups, self.num_heads_per_group * 4, dtype=dtype).normal_(mean=0,std=dd_std)) #  (4096, 1, 128)
+        if n_splits == 4:
+            self.dw1 = nn.parameter.Parameter(torch.zeros(self.query_input_dim, self.num_groups, C, self.dynamic_w_hidden_dim, dtype=dtype).normal_(mean=0,std=dw1_std)) #(4096, 1, 4, 128)
+            G, K, M = self.num_groups, self.dynamic_w_hidden_dim, self.num_heads_per_group
+            I = dynamic_hidden_dim * 2 
+            self.qkw = nn.parameter.Parameter(torch.zeros([G, C, K, I, M], dtype=dtype).normal_(mean=0,std=qkw_std)) # (1, 4, 128, 4, 32)
+            # self.qw_bias = nn.parameter.Parameter(torch.zeros(G, 4, I, M, dtype=dtype))
+            self.dd = nn.parameter.Parameter(torch.zeros(self.query_input_dim, self.num_groups, self.num_heads_per_group * C, dtype=dtype).normal_(mean=0,std=dd_std)) #  (4096, 1, 128)
+        elif n_splits == 2:
+            self.dw1 = nn.parameter.Parameter(torch.zeros((self.num_groups * C * rank * self.dynamic_w_hidden_dim), self.query_input_dim, dtype=dtype).normal_(mean=0,std=dw1_std)) #(4096, 1, 4, 128)
+            G, K, M = self.num_groups, self.dynamic_w_hidden_dim, self.num_heads_per_group
+            I = dynamic_hidden_dim * 2 
+            self.qkw = nn.parameter.Parameter(torch.zeros((G* C* rank*K), (G*C*rank*K), dtype=dtype).normal_(mean=0,std=qkw_std)) # (1, 4, 128, 4, 32)
+            # self.qw_bias = nn.parameter.Parameter(torch.zeros(G, 4, I, M, dtype=dtype))
+            self.dd = nn.parameter.Parameter(torch.zeros(self.num_groups * self.num_heads_per_group * C, self.query_input_dim, dtype=dtype).normal_(mean=0,std=dd_std)) #  (4096, 1, 128)
         self.norm_scale = nn.Parameter(torch.ones(self.num_groups, dtype=dtype) * 0.001)
 
         self.merge_weights()
@@ -932,21 +978,44 @@ class DynamicWeightProjection(nn.Module):
 
 
     def forward(self,query_vec,KW:Optional[torch.Tensor]=None, gen_cache:Optional[bool]=False, keep_group_dim=False):  
-        dw_hidden = torch.einsum('BTD,DGCK->BTGCK', query_vec, self.dw1)  # C=4 [pre,post]*[query,key]
-        dw_hidden = self.dw_hidden_activation(dw_hidden) #BTGCK
-        w1, w2 = torch.split(torch.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, self.qkw), self.qkw.shape[-2]//2, dim=-2) #BTGC(2I)M -> [BTGCIM] * 2
-        w1 = self.dw1_norm(w1) # BTGCIM
-        w2 = self.dw1_norm(w2) * self.norm_scale
-        if not keep_group_dim:
-            w1 = w1.squeeze(2)
-            w2 = w2.squeeze(2)
-        pre_qw1, pre_kw1, post_qw1, post_kw1 = unbind(w1, 4, dim=-3) # BTG4IM->[BTGIM]*4
-        pre_qw2, pre_kw2, post_qw2, post_kw2 = unbind(w2, 4, dim=-3) 
-        dd = torch.einsum('BTD,DGM->BTGM', query_vec, self.dd) # BTG(4M)
-        dd = self.dw_activation(dd)
-        if not keep_group_dim:
-            dd = dd.squeeze(-2)
-        pre_qdd, pre_kdd, post_qdd, post_kdd = torch.split(dd, dd.shape[-1] // 4, dim=-1) # BTG(4N)->[BTGN]*4
+        if self.n_splits == 4:
+            dw_hidden = torch.einsum('BTD,DGCK->BTGCK', query_vec, self.dw1)  # C=4 [pre,post]*[query,key]
+            dw_hidden = self.dw_hidden_activation(dw_hidden) #BTGCK
+            w1, w2 = torch.split(torch.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, self.qkw), self.qkw.shape[-2]//2, dim=-2) #BTGC(2I)M -> [BTGCIM] * 2
+            # w1, w2 = torch.split(torch.einsum('BTGCK,GCKIM->BTGCIM', dw_hidden, self.qkw)+self.qw_bias, self.qkw.shape[-2]//2, dim=-2) #BTGC(2I)M -> [BTGCIM] * 2
+            w1 = self.dw1_norm(w1) # BTGCIM
+            w2 = self.dw1_norm(w2) * self.norm_scale#.to(w2.dtype)
+            if not keep_group_dim:
+                w1 = w1.squeeze(2)
+                w2 = w2.squeeze(2)
+            pre_qw1, pre_kw1, post_qw1, post_kw1 = unbind(w1, 4, dim=-3) # BTG4IM->[BTGIM]*4
+            pre_qw2, pre_kw2, post_qw2, post_kw2 = unbind(w2, 4, dim=-3) 
+            dd = torch.einsum('BTD,DGM->BTGM', query_vec, self.dd) # BTG(4M)
+            dd = self.dw_activation(dd)
+            if not keep_group_dim:
+                dd = dd.squeeze(-2)
+            pre_qdd, pre_kdd, post_qdd, post_kdd = torch.split(dd, dd.shape[-1] // 4, dim=-1) # BTG(4N)->[BTGN]*4
+            key_wise = False
+            if not key_wise:
+                pre_kdd, post_kdd = None, None
+                pre_kw1, post_kw1, pre_kw2, post_kw2 = None, None, None, None
+        elif self.n_splits == 2:
+            dw_hidden = F.linear(query_vec, self.dw1.to(query_vec.dtype)) # BTD, D(CRK) -> BT(CRK)
+            dw_hidden = self.dw_hidden_activation(dw_hidden) #BT(CRK)
+            dw = F.linear(dw_hidden, self.qkw.to(dw_hidden.dtype)) # BT(CRK), (CRK,CRK) -> BT(CRK)
+            dw = rearrange(dw, 'B T (C R M) -> B T C R M', R=2, M=self.num_heads_per_group) # BT(CRM)
+            dw = self.dw1_norm(dw) # BTCRM
+            dw1, dw2 = torch.split(dw, dw.shape[-3]//2, dim=-3) # [BTCRM] * 2
+            dw2 = dw2 * self.norm_scale#.to(dw1.dtype)
+            pre_qw1, post_qw1 = unbind(dw1, 2, dim=-3) # BTR2M->[BTRM]*2
+            pre_qw2, post_qw2 = unbind(dw2, 2, dim=-3) # BTR2M->[BTRM]*2
+            pre_kw1, pre_kw2 = None, None
+            post_kw1, post_kw2 = None, None
+            dd = F.linear(query_vec, self.dd.to(query_vec.dtype)) # BTD, D(CN) -> BTCN
+            dd = self.dw_activation(dd)
+            pre_qdd, post_qdd = torch.split(dd, dd.shape[-1] // 2, dim=-1) # BTCN->[BTCN]*2
+            pre_kdd, post_kdd = None, None
+    
         pre_dw_args = (pre_qw1, pre_qw2, pre_kw1, pre_kw2, pre_qdd, pre_kdd)
         post_dw_args = (post_qw1, post_qw2, post_kw1, post_kw2, post_qdd, post_kdd)
         if gen_cache: # generate KW cache
@@ -1147,8 +1216,8 @@ class GPT(nn.Module):
         self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
         attn_window_sizes = [None] * num_layers
         if use_dcmha: # LGLL
+            # attn_window_sizes = [256, None, 256, 256] * 3
             attn_window_sizes = [256, None, 256, 256] * 3
-            # attn_window_sizes = [256, None, None, None] * 3
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -1271,6 +1340,8 @@ class GPT(nn.Module):
         disable_unet = False if not self.use_mudd else True
         disable_x0 = False if not self.use_mudd else True
         disable_v0 = False if not self.use_mudd else True
+
+        disable_unet, disable_x0, disable_v0 = True, True, True
         
         disable_bigram = False #if not (self.use_mudd and self.mudd_bigrams) else True
         disable_smear = False
@@ -1324,6 +1395,7 @@ class GPT(nn.Module):
                         x = mixed[0]
             if not disable_unet:
                 skips.append(x)
+            # print(i, x.dtype, x.mean().item(), x.std().item())
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
@@ -1922,7 +1994,7 @@ def main() -> None:
     if rank == 0:
         print('model parameters:')
         for k, v in model.named_parameters():
-            print(k, v.shape, v.mean().item(), v.std().item())
+            print(k, v.shape, v.dtype, v.mean().item(), v.std().item())
         for block in base_model.dynamic_dense:
             if block is not None:
                 print('lidx', block.lidx, 'num_ways', block.C, 'local_window_size', block.local_window_size)
@@ -1979,6 +2051,7 @@ def main() -> None:
         for s in base_model.ve_layer_scales:
             scalar_params.append(s)
     scalar_params.extend(mudd_scalar_params + mudd_matrix_params)
+    # scalar_params = unique_param_list(scalar_params)
     # matrix_params.extend(mudd_matrix_params)
     optimizer_tok = torch.optim.AdamW(
         tok_params,
@@ -2043,6 +2116,7 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     log0(f"use_mudd:{args.use_mudd}")
     log0(f"multiway:{args.multiway}")
+    log0(f"checkpoint_every:{args.checkpoint_every}")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -2134,6 +2208,22 @@ def main() -> None:
             if tb_writer is not None:
                 tb_writer.add_scalar("val/loss", float(val_loss), step)
                 tb_writer.add_scalar("val/bpb", float(val_bpb), step)
+            if (
+                master_process
+                and args.checkpoint_every > 0
+                and step > 0
+                and step % args.checkpoint_every == 0
+            ):
+                ckpt_dir = os.path.join("logs", "checkpoints", args.run_id)
+                os.makedirs(ckpt_dir, exist_ok=True)
+                ckpt_path = os.path.join(ckpt_dir, f"step_{step:06d}.pt")
+                torch.save(
+                    {"step": step, "model": base_model.state_dict()},
+                    ckpt_path,
+                )
+                log0(f"checkpoint_saved:{ckpt_path}")
+            if distributed:
+                dist.barrier()
             torch.cuda.synchronize()
             t0 = time.perf_counter()
         if last_step:
@@ -2150,6 +2240,7 @@ def main() -> None:
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        raw_grad_norm = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
