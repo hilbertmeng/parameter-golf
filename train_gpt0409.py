@@ -232,7 +232,8 @@ class MultiwayDynamicDenseBlock(nn.Module):
 		else:l = local_window_size
 		self.local_window_size = local_window_size;hid_dim, out_dim = l * self.C, l * self.C;self.dim = dim;self.mudd_in_channels = mudd_in_channels or dim
 		self.w1 = CastedLinear(self.mudd_in_channels, hid_dim, bias=False);self.act = nn.GELU();self.w2 = CastedLinear(hid_dim, out_dim, bias=True);self.w2._zero_init = True;self.w2.bias.data.fill_(0.0)
-		self.channels = dim // 1;self.scale = nn.Parameter(torch.ones(self.channels * self.C, dtype=torch.float32)*0.1)
+		self.mudd_scale = 0.01 
+		self.channels = dim // 1;self.scale = nn.Parameter(torch.ones(self.channels * self.C, dtype=torch.float32)*self.mudd_scale)
 	def forward(self, x):
 		x = self.norm(x[:,:,:self.mudd_in_channels])
 		dw = self.w2(self.act(self.w1(x)))
@@ -300,12 +301,19 @@ class CausalSelfAttention(nn.Module):
 			y=flash_attn_3_func(q,k,v,causal=True)
 			if self.use_xsa:y=self._xsa_efficient(y,v)
 		y=y.reshape(bsz,seqlen,dim);return self.proj(y)
+
 class MLP(nn.Module):
 	def __init__(self,dim,mlp_mult):super().__init__();hidden=int(mlp_mult*dim);self.fc=CastedLinear(dim,hidden,bias=False);self.proj=CastedLinear(hidden,dim,bias=False);self.proj._zero_init=True
 	def forward(self,x):return self.proj(F.leaky_relu(self.fc(x),negative_slope=.5).square())
 class Block(nn.Module):
-	def __init__(self,dim,num_heads,num_kv_heads,mlp_mult,rope_base,qk_gain_init,train_seq_len,layer_idx=0,ln_scale=False,use_kv_shift=False,use_mudd=False, attn_window_size=None,use_dcmha=False):super().__init__();self.attn_norm=RMSNorm();self.mlp_norm=RMSNorm();self.attn=CausalSelfAttention(dim,num_heads,num_kv_heads,rope_base,qk_gain_init,train_seq_len,use_kv_shift=use_kv_shift,attn_window_size=attn_window_size,use_dcmha=use_dcmha);self.mlp=MLP(dim,mlp_mult);self.attn_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.mlp_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.resid_mix=nn.Parameter(torch.stack((torch.ones(dim),torch.zeros(dim))).float()) if not use_mudd else None;self.ln_scale_factor=1./math.sqrt(layer_idx+1)if ln_scale else 1.;self.parallel=False;self.use_mudd= use_mudd
-	def forward(self,x,x0):
+	def __init__(self,dim,num_heads,num_kv_heads,mlp_mult,rope_base,qk_gain_init,train_seq_len,layer_idx=0,ln_scale=False,use_kv_shift=False,use_mudd=False, attn_window_size=None,use_dcmha=False):
+		super().__init__();self.attn_norm=RMSNorm();self.mlp_norm=RMSNorm();self.attn=CausalSelfAttention(dim,num_heads,num_kv_heads,rope_base,qk_gain_init,train_seq_len,use_kv_shift=use_kv_shift,attn_window_size=attn_window_size,use_dcmha=use_dcmha);self.mlp=MLP(dim,mlp_mult);self.attn_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.mlp_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.resid_mix=nn.Parameter(torch.stack((torch.ones(dim),torch.zeros(dim))).float()) if not use_mudd else None
+		# self.resid_mix = None
+
+		self.ln_scale_factor=1./math.sqrt(layer_idx+1)if ln_scale else 1.;self.parallel=False;self.use_mudd=use_mudd
+	def forward(self,x,x0, is_recurrent=False, looping_active=False):
+		if is_recurrent and not looping_active:
+			return x[-1] if isinstance(x, tuple) else x
 		if self.use_mudd:
 			if isinstance(x, tuple):
 				x_in = x[-1]
@@ -314,8 +322,11 @@ class Block(nn.Module):
 				x_in = x
 				normed_x = self.attn_norm(x_in) * self.ln_scale_factor
 		else:
-			mix=self.resid_mix.to(dtype=x.dtype)
-			x_in=mix[0][None,None,:]*x+mix[1][None,None,:]*x0
+			if self.resid_mix is None:
+				x_in = x
+			else:
+				mix=self.resid_mix.to(dtype=x.dtype)
+				x_in=mix[0][None,None,:]*x+mix[1][None,None,:]*x0
 			normed_x = self.attn_norm(x_in)*self.ln_scale_factor
 		attn_out=self.attn(normed_x)
 		if self.parallel:mlp_out=self.mlp(self.mlp_norm(x_in)*self.ln_scale_factor);x_out=x_in+self.attn_scale.to(dtype=x_in.dtype)[None,None,:]*attn_out+self.mlp_scale.to(dtype=x_in.dtype)[None,None,:]*mlp_out
@@ -342,24 +353,46 @@ class GPT(nn.Module):
 			for i in range(max(0,h.num_layers-h.xsa_last_n),h.num_layers):self.blocks[i].attn.use_xsa=True
 		if h.parallel_residual_start>=0:
 			for i in range(h.parallel_residual_start,h.num_layers):self.blocks[i].parallel=True
-		if self.use_mudd:
-			self.looping_active=True
-		else:
-			self.looping_active=False
+		self.looping_active=False
+		# if self.use_mudd:
+		# 	self.looping_active=True
+		self.is_recur_indices = [False] * (h.num_layers + h.num_loops* (h.loop_end- h.loop_start))
 		if h.num_loops>0:
 			loop_seg=list(range(h.loop_start,h.loop_end+1));all_indices=list(range(h.loop_start))
 			for _ in range(h.num_loops+1):all_indices.extend(loop_seg)
 			all_indices.extend(range(h.loop_end+1,h.num_layers));num_enc=len(all_indices)//2;self.encoder_indices=all_indices[:num_enc];self.decoder_indices=all_indices[num_enc:]
+			is_recur_indices = []
+			for i,j in enumerate(all_indices):
+				if i==0:
+					is_recur_indices.append(False)
+				else:
+					is_recur_indices.append(j in all_indices[:i-1])
+			self.is_recur_indices = is_recur_indices
+			print('is_recur_indices', is_recur_indices)
+			print('all_indices', all_indices)
+			print('encoder_indices', self.encoder_indices)
+			print('decoder_indices', self.decoder_indices)
 		else:self.encoder_indices=list(range(self.num_encoder_layers));self.decoder_indices=list(range(self.num_encoder_layers,h.num_layers))
 		self.num_skip_weights=min(len(self.encoder_indices),len(self.decoder_indices))
-		self.skip_weights=nn.Parameter(torch.ones(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if not h.use_mudd else None
-		self.skip_gates=nn.Parameter(torch.zeros(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if h.skip_gates_enabled and not h.use_mudd else None
+		use_mudd = h.use_mudd
+		# use_mudd = True # hack skip weights
+		self.skip_weights=nn.Parameter(torch.ones(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if not use_mudd else None
+		self.skip_gates=nn.Parameter(torch.zeros(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if h.skip_gates_enabled and not use_mudd else None
+		# self.skip_weights = None # hack skip weights
+		# self.skip_gates = None # hack skip gates
 		if h.use_mudd:
 			looped_num_layers = len(all_indices)
-			self.num_ways = [4] * looped_num_layers
+			# self.num_ways = [4] * looped_num_layers
+			# self.num_ways = [4, 1, 1, 1] * looped_num_layers
+			# self.mudd_skip_indices = list(range(8))
+			self.mudd_skip_indices = []
+			self.num_ways = [1]*8+[1,1,4,1]*3
 			self.mudd_q_dilation=h.mudd_q_dilation;self.mudd_k_dilation=h.mudd_k_dilation;self.mudd_in_channels=h.model_dim
-			local_window_sizes=[None]*looped_num_layers;num_base_layers=1
-			self.dynamic_dense=nn.ModuleList([MultiwayDynamicDenseBlock(h.model_dim,i,last_layer=i==looped_num_layers-1,multiway=True,q_dilation=self.mudd_q_dilation,k_dilation=self.mudd_k_dilation,base_layer=num_base_layers,mudd_in_channels=self.mudd_in_channels,num_ways=self.num_ways[i],local_window_size=local_window_sizes[i]) if i%self.mudd_q_dilation==0 or i==looped_num_layers-1 else None for i in range(looped_num_layers)])
+			# local_window_sizes=[None]*looped_num_layers
+			# local_window_sizes=[2]*8 + [2, None, None,None]*looped_num_layers
+			local_window_sizes= [2, None, None,None]*looped_num_layers
+			num_base_layers=1
+			self.dynamic_dense=nn.ModuleList([MultiwayDynamicDenseBlock(h.model_dim,i,last_layer=i==looped_num_layers-1,multiway=True,q_dilation=self.mudd_q_dilation,k_dilation=self.mudd_k_dilation,base_layer=num_base_layers,mudd_in_channels=self.mudd_in_channels,num_ways=self.num_ways[i],local_window_size=local_window_sizes[i]) if (i%self.mudd_q_dilation==0 or i==looped_num_layers-1) and i not in self.mudd_skip_indices else None for i in range(looped_num_layers)])
 		else:self.dynamic_dense=nn.ModuleList()
 		if h.mudd_prenorm:self.mudd_prenorm=RMSNorm()
 		else:self.mudd_prenorm=lambda x:x
@@ -375,29 +408,33 @@ class GPT(nn.Module):
 	def forward_logits(self,input_ids):
 		x=self.tok_emb(input_ids);x=F.rms_norm(x,(x.size(-1),))
 		if self.embed_proj is not None:x=self.embed_proj(x)
-		x0=x;hiddens=[];skips=[];enc_iter=self.encoder_indices if self.looping_active else range(self.num_encoder_layers);dec_iter=self.decoder_indices if self.looping_active else range(self.num_encoder_layers,self.num_encoder_layers+self.num_decoder_layers)
+		x0=x;hiddens=[];skips=[];enc_iter=self.encoder_indices if self.looping_active or self.use_mudd else range(self.num_encoder_layers);dec_iter=self.decoder_indices if self.looping_active or self.use_mudd else range(self.num_encoder_layers,self.num_encoder_layers+self.num_decoder_layers)
 		if self.use_mudd:hiddens.append(self.mudd_prenorm(x))
 		mudd_idx=0;looped_num_layers=len(enc_iter)+len(dec_iter) if self.use_mudd else 0
-		for i in enc_iter:
-			x=self.blocks[i](x,x0)
+		for _idx, i in enumerate(enc_iter):
+			x=self.blocks[i](x,x0, is_recurrent=self.is_recur_indices[_idx], looping_active=self.looping_active)
 			if not self.use_mudd:
 				skips.append(x)
 			if self.use_mudd:
 				if mudd_idx%self.mudd_k_dilation==0:hiddens.append(self.mudd_prenorm(x))
-				if mudd_idx%self.mudd_q_dilation==0:
+				if mudd_idx%self.mudd_q_dilation==0 and mudd_idx not in self.mudd_skip_indices:
 					dw=self.dynamic_dense[mudd_idx](x);mixed=self.dynamic_dense[mudd_idx].layer_mix(x,hiddens,dw);x=mixed
 				mudd_idx+=1
+		        # print('enc_iter', i, mudd_idx-1)
 		for(skip_idx,i)in enumerate(dec_iter):
-			if not self.use_mudd and skip_idx<self.num_skip_weights and skips:
+			if not self.use_mudd and skip_idx<self.num_skip_weights and skips and self.skip_weights is not None:
 				scaled_skip=self.skip_weights[skip_idx].to(dtype=x.dtype)[None,None,:]*skips.pop()
 				if self.skip_gates is not None:g=torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None,None,:];x=torch.lerp(scaled_skip,x,g)
 				else:x=x+scaled_skip
-			x=self.blocks[i](x,x0)
+			x=self.blocks[i](x,x0, is_recurrent=self.is_recur_indices[skip_idx+len(enc_iter)], looping_active=self.looping_active)
+			typex= type(x)
 			if self.use_mudd:
 				if mudd_idx%self.mudd_k_dilation==0:hiddens.append(self.mudd_prenorm(x))
-				if mudd_idx%self.mudd_q_dilation==0 or mudd_idx==looped_num_layers-1:
+				if (mudd_idx%self.mudd_q_dilation==0 and mudd_idx not in self.mudd_skip_indices) or mudd_idx==looped_num_layers-1:
 					dw=self.dynamic_dense[mudd_idx](x);mixed=self.dynamic_dense[mudd_idx].layer_mix(x,hiddens,dw);x=mixed
 				mudd_idx+=1
+				# print('dec_iter', i, mudd_idx-1)
+			# print(i, mudd_idx, typex,type(x), self.is_recur_indices[skip_idx+len(enc_iter)])
 		x=self.final_norm(x)
 		if self.head_proj is not None:x=self.head_proj(x)
 		if self.tie_embeddings:logits_proj=F.linear(x,self.tok_emb.weight)
@@ -647,6 +684,10 @@ def train_model(h,device,val_data):
 		print('model parameters:')
 		for name,param in model.named_parameters():
 			print(name, param.shape, param.dtype, param.mean().item(), param.std().item())
+		if h.use_mudd:
+			for block in base_model.dynamic_dense:
+				if block is not None:
+					print('mudd lidx', block.lidx, 'num_ways', block.C, 'local_window_size', block.local_window_size, 'channels', block.channels, 'scale', block.mudd_scale)
 	log(f"model_params:{sum(p.numel()for p in base_model.parameters())}");optimizers=Optimizers(h,base_model);train_loader=ShuffledSequenceLoader(h,device);tb_writer=None
 	if h.tensorboard_dir and h.is_main_process: tensorboard_dir=os.path.join(h.tensorboard_dir,h.run_id);os.makedirs(tensorboard_dir,exist_ok=True);tb_writer=SummaryWriter(log_dir=tensorboard_dir)
 	max_wallclock_ms=1e3*h.max_wallclock_seconds if h.max_wallclock_seconds>0 else None
@@ -678,12 +719,12 @@ def train_model(h,device,val_data):
 		for warmup_step in range(h.warmup_steps):
 			_,_,_=step_fn(warmup_step,1.)
 			if warmup_step<=5 or(warmup_step+1)%10==0 or warmup_step+1==h.warmup_steps:log(f"warmup_step: {warmup_step+1}/{h.warmup_steps}")
-		if h.num_loops>0 and not h.use_mudd:
+		if h.num_loops>0: #and not h.use_mudd:
 			base_model.looping_active=True;log(f"loop_warmup:enabled encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
 			for warmup_step in range(h.warmup_steps):
 				_,_,_=step_fn(warmup_step,1.)
 				if warmup_step<=5 or(warmup_step+1)%10==0 or warmup_step+1==h.warmup_steps:log(f"loop_warmup_step: {warmup_step+1}/{h.warmup_steps}")
-			if not base_model.use_mudd:base_model.looping_active=False
+			base_model.looping_active=False
 		base_model.load_state_dict(initial_model_state,strict=True)
 		for(opt,state)in zip(optimizers,initial_optimizer_states,strict=True):opt.load_state_dict(state)
 		optimizers.zero_grad_all()
