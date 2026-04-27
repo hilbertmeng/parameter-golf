@@ -7,7 +7,10 @@ from torch.utils.tensorboard import SummaryWriter
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 from einops import rearrange
 from typing import Optional, Tuple
-class Hyperparameters:data_dir=os.environ.get('DATA_DIR','./data/');seed=int(os.environ.get('SEED',1337));run_id=os.environ.get('RUN_ID',str(uuid.uuid4()));iterations=int(os.environ.get('ITERATIONS',20000));warmdown_frac=float(os.environ.get('WARMDOWN_FRAC',.72));warmup_steps=int(os.environ.get('WARMUP_STEPS',20));train_batch_tokens=int(os.environ.get('TRAIN_BATCH_TOKENS',786432));train_seq_len=int(os.environ.get('TRAIN_SEQ_LEN',2048));train_log_every=int(os.environ.get('TRAIN_LOG_EVERY',500));max_wallclock_seconds=float(os.environ.get('MAX_WALLCLOCK_SECONDS',6e2));val_batch_tokens=int(os.environ.get('VAL_BATCH_TOKENS',524288));eval_seq_len=int(os.environ.get('EVAL_SEQ_LEN',2048));val_loss_every=int(os.environ.get('VAL_LOSS_EVERY',4000));sliding_window_enabled=bool(int(os.environ.get('SLIDING_WINDOW_ENABLED','1')));vocab_size=int(os.environ.get('VOCAB_SIZE',8192));num_layers=int(os.environ.get('NUM_LAYERS',11));xsa_last_n=int(os.environ.get('XSA_LAST_N',11));model_dim=int(os.environ.get('MODEL_DIM',512));embedding_dim=int(os.environ.get('EMBEDDING_DIM',512));num_kv_heads=int(os.environ.get('NUM_KV_HEADS',4));num_heads=int(os.environ.get('NUM_HEADS',8));mlp_mult=float(os.environ.get('MLP_MULT',4.));skip_gates_enabled=bool(int(os.environ.get('SKIP_GATES_ENABLED','1')));tie_embeddings=bool(int(os.environ.get('TIE_EMBEDDINGS','1')));logit_softcap=float(os.environ.get('LOGIT_SOFTCAP',3e1));rope_base=float(os.environ.get('ROPE_BASE',1e4));rope_dims=int(os.environ.get('ROPE_DIMS',16));rope_train_seq_len=int(os.environ.get('ROPE_TRAIN_SEQ_LEN',2048));ln_scale=bool(int(os.environ.get('LN_SCALE','1')));qk_gain_init=float(os.environ.get('QK_GAIN_INIT',5.));num_loops=int(os.environ.get('NUM_LOOPS',2));loop_start=int(os.environ.get('LOOP_START',3));loop_end=int(os.environ.get('LOOP_END',5));enable_looping_at=float(os.environ.get('ENABLE_LOOPING_AT',.35));parallel_residual_start=int(os.environ.get('PARALLEL_RESIDUAL_START',7));min_lr=float(os.environ.get('MIN_LR',.0));embed_lr=float(os.environ.get('EMBED_LR',.6));head_lr=float(os.environ.get('HEAD_LR',.008));tied_embed_lr=float(os.environ.get('TIED_EMBED_LR',.03));tied_embed_init_std=float(os.environ.get('TIED_EMBED_INIT_STD',.005));matrix_lr=float(os.environ.get('MATRIX_LR',.022));scalar_lr=float(os.environ.get('SCALAR_LR',.02));muon_momentum=float(os.environ.get('MUON_MOMENTUM',.99));muon_backend_steps=int(os.environ.get('MUON_BACKEND_STEPS',5));muon_momentum_warmup_start=float(os.environ.get('MUON_MOMENTUM_WARMUP_START',.92));muon_momentum_warmup_steps=int(os.environ.get('MUON_MOMENTUM_WARMUP_STEPS',1500));muon_row_normalize=bool(int(os.environ.get('MUON_ROW_NORMALIZE','1')));beta1=float(os.environ.get('BETA1',.9));beta2=float(os.environ.get('BETA2',.95));adam_eps=float(os.environ.get('ADAM_EPS',1e-08));grad_clip_norm=float(os.environ.get('GRAD_CLIP_NORM',.3));eval_stride=int(os.environ.get('EVAL_STRIDE',64));muon_beta2=float(os.environ.get('MUON_BETA2',.95));adam_wd=float(os.environ.get('ADAM_WD',.02));muon_wd=float(os.environ.get('MUON_WD',.095));embed_wd=float(os.environ.get('EMBED_WD',.085));ema_decay=float(os.environ.get('EMA_DECAY',.9965));ttt_enabled=bool(int(os.environ.get('TTT_ENABLED','0')));ttt_lr=float(os.environ.get('TTT_LR',.005));ttt_epochs=int(os.environ.get('TTT_EPOCHS',3));ttt_momentum=float(os.environ.get('TTT_MOMENTUM',.9));ttt_chunk_tokens=int(os.environ.get('TTT_CHUNK_TOKENS',32768));etlb_enabled=bool(int(os.environ.get('ETLB_ENABLED','0')));etlb_lr=float(os.environ.get('ETLB_LR',.05));etlb_steps=int(os.environ.get('ETLB_STEPS',5));etlb_clip=float(os.environ.get('ETLB_CLIP',3.));compressor=os.environ.get('COMPRESSOR','brotli');gptq_calibration_batches=int(os.environ.get('GPTQ_CALIBRATION_BATCHES',64));gptq_reserve_seconds=float(os.environ.get('GPTQ_RESERVE_SECONDS',12.));matrix_bits=int(os.environ.get('MATRIX_BITS',6));embed_bits=int(os.environ.get('EMBED_BITS',8));matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',12.85));embed_clip_sigmas=float(os.environ.get('EMBED_CLIP_SIGMAS',2e1));distributed='RANK'in os.environ and'WORLD_SIZE'in os.environ;rank=int(os.environ.get('RANK','0'));world_size=int(os.environ.get('WORLD_SIZE','1'));local_rank=int(os.environ.get('LOCAL_RANK','0'));is_main_process=rank==0;grad_accum_steps=8//world_size;datasets_dir=os.path.join(data_dir,'datasets',f"fineweb10B_sp{vocab_size}");train_files=os.path.join(datasets_dir,'fineweb_train_*.bin');val_files=os.path.join(datasets_dir,'fineweb_val_*.bin');tokenizer_path=os.path.join(data_dir,'tokenizers',f"fineweb_{vocab_size}_bpe.model");logfile=f"logs/{run_id}.txt";model_path='final_model.pt';quantized_model_path='final_model.int6.ptz';tensorboard_dir = os.environ.get("TENSORBOARD_DIR", "./logs/tensorboard");use_mudd=bool(int(os.environ.get('USE_MUDD','0')));mudd_q_dilation=int(os.environ.get('MUDD_Q_DILATION','1'));mudd_k_dilation=int(os.environ.get('MUDD_K_DILATION','1'));mudd_prenorm=bool(int(os.environ.get('MUDD_PRENORM','0')));use_kv_shift=bool(int(os.environ.get('USE_KV_SHIFT','0')));use_dcmha=bool(int(os.environ.get('USE_DCMHA','0')))
+
+# torch._inductor.config.force_disable_caches = True
+
+class Hyperparameters:data_dir=os.environ.get('DATA_DIR','./data/');seed=int(os.environ.get('SEED',1337));run_id=os.environ.get('RUN_ID',str(uuid.uuid4()));iterations=int(os.environ.get('ITERATIONS',20000));warmdown_frac=float(os.environ.get('WARMDOWN_FRAC',.72));warmup_steps=int(os.environ.get('WARMUP_STEPS',20));train_batch_tokens=int(os.environ.get('TRAIN_BATCH_TOKENS',786432));train_seq_len=int(os.environ.get('TRAIN_SEQ_LEN',2048));train_log_every=int(os.environ.get('TRAIN_LOG_EVERY',500));max_wallclock_seconds=float(os.environ.get('MAX_WALLCLOCK_SECONDS',6e2));val_batch_tokens=int(os.environ.get('VAL_BATCH_TOKENS',524288));eval_seq_len=int(os.environ.get('EVAL_SEQ_LEN',2048));val_loss_every=int(os.environ.get('VAL_LOSS_EVERY',4000));sliding_window_enabled=bool(int(os.environ.get('SLIDING_WINDOW_ENABLED','1')));vocab_size=int(os.environ.get('VOCAB_SIZE',8192));num_layers=int(os.environ.get('NUM_LAYERS',11));xsa_last_n=int(os.environ.get('XSA_LAST_N',11));model_dim=int(os.environ.get('MODEL_DIM',512));embedding_dim=int(os.environ.get('EMBEDDING_DIM',512));num_kv_heads=int(os.environ.get('NUM_KV_HEADS',4));num_heads=int(os.environ.get('NUM_HEADS',8));mlp_mult=float(os.environ.get('MLP_MULT',4.));skip_gates_enabled=bool(int(os.environ.get('SKIP_GATES_ENABLED','1')));tie_embeddings=bool(int(os.environ.get('TIE_EMBEDDINGS','1')));logit_softcap=float(os.environ.get('LOGIT_SOFTCAP',3e1));rope_base=float(os.environ.get('ROPE_BASE',1e4));rope_dims=int(os.environ.get('ROPE_DIMS',16));rope_train_seq_len=int(os.environ.get('ROPE_TRAIN_SEQ_LEN',2048));ln_scale=bool(int(os.environ.get('LN_SCALE','1')));qk_gain_init=float(os.environ.get('QK_GAIN_INIT',5.));num_loops=int(os.environ.get('NUM_LOOPS',2));loop_start=int(os.environ.get('LOOP_START',3));loop_end=int(os.environ.get('LOOP_END',5));enable_looping_at=float(os.environ.get('ENABLE_LOOPING_AT',.35));parallel_residual_start=int(os.environ.get('PARALLEL_RESIDUAL_START',7));min_lr=float(os.environ.get('MIN_LR',.0));embed_lr=float(os.environ.get('EMBED_LR',.6));head_lr=float(os.environ.get('HEAD_LR',.008));tied_embed_lr=float(os.environ.get('TIED_EMBED_LR',.03));tied_embed_init_std=float(os.environ.get('TIED_EMBED_INIT_STD',.005));matrix_lr=float(os.environ.get('MATRIX_LR',.022));scalar_lr=float(os.environ.get('SCALAR_LR',.02));muon_momentum=float(os.environ.get('MUON_MOMENTUM',.99));muon_backend_steps=int(os.environ.get('MUON_BACKEND_STEPS',5));muon_momentum_warmup_start=float(os.environ.get('MUON_MOMENTUM_WARMUP_START',.92));muon_momentum_warmup_steps=int(os.environ.get('MUON_MOMENTUM_WARMUP_STEPS',1500));muon_row_normalize=bool(int(os.environ.get('MUON_ROW_NORMALIZE','1')));beta1=float(os.environ.get('BETA1',.9));beta2=float(os.environ.get('BETA2',.95));adam_eps=float(os.environ.get('ADAM_EPS',1e-08));grad_clip_norm=float(os.environ.get('GRAD_CLIP_NORM',.3));eval_stride=int(os.environ.get('EVAL_STRIDE',64));muon_beta2=float(os.environ.get('MUON_BETA2',.95));adam_wd=float(os.environ.get('ADAM_WD',.02));muon_wd=float(os.environ.get('MUON_WD',.095));embed_wd=float(os.environ.get('EMBED_WD',.085));ema_decay=float(os.environ.get('EMA_DECAY',.9965));ttt_enabled=bool(int(os.environ.get('TTT_ENABLED','0')));ttt_lr=float(os.environ.get('TTT_LR',.005));ttt_epochs=int(os.environ.get('TTT_EPOCHS',3));ttt_momentum=float(os.environ.get('TTT_MOMENTUM',.9));ttt_chunk_tokens=int(os.environ.get('TTT_CHUNK_TOKENS',32768));etlb_enabled=bool(int(os.environ.get('ETLB_ENABLED','0')));etlb_lr=float(os.environ.get('ETLB_LR',.05));etlb_steps=int(os.environ.get('ETLB_STEPS',5));etlb_clip=float(os.environ.get('ETLB_CLIP',3.));compressor=os.environ.get('COMPRESSOR','brotli');gptq_calibration_batches=int(os.environ.get('GPTQ_CALIBRATION_BATCHES',64));gptq_reserve_seconds=float(os.environ.get('GPTQ_RESERVE_SECONDS',12.));matrix_bits=int(os.environ.get('MATRIX_BITS',6));embed_bits=int(os.environ.get('EMBED_BITS',8));matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',12.85));embed_clip_sigmas=float(os.environ.get('EMBED_CLIP_SIGMAS',2e1));distributed='RANK'in os.environ and'WORLD_SIZE'in os.environ;rank=int(os.environ.get('RANK','0'));world_size=int(os.environ.get('WORLD_SIZE','1'));local_rank=int(os.environ.get('LOCAL_RANK','0'));is_main_process=rank==0;grad_accum_steps=8//world_size;datasets_dir=os.path.join(data_dir,'datasets',f"fineweb10B_sp{vocab_size}");train_files=os.path.join(datasets_dir,'fineweb_train_*.bin');val_files=os.path.join(datasets_dir,'fineweb_val_*.bin');tokenizer_path=os.path.join(data_dir,'tokenizers',f"fineweb_{vocab_size}_bpe.model");logfile=f"logs/{run_id}.txt";model_path='final_model.pt';quantized_model_path='final_model.int6.ptz';tensorboard_dir = os.environ.get("TENSORBOARD_DIR", "./logs/tensorboard");use_mudd=bool(int(os.environ.get('USE_MUDD','0')));mudd_q_dilation=int(os.environ.get('MUDD_Q_DILATION','1'));mudd_k_dilation=int(os.environ.get('MUDD_K_DILATION','1'));mudd_prenorm=bool(int(os.environ.get('MUDD_PRENORM','0')));use_kv_shift=bool(int(os.environ.get('USE_KV_SHIFT','0')));use_dcmha=bool(int(os.environ.get('USE_DCMHA','0')));keep_unet=bool(int(os.environ.get('KEEP_UNET','1')));mudd_compress=bool(int(os.environ.get('MUDD_COMPRESS','0')));mudd_muon=bool(int(os.environ.get('MUDD_MUON','0')));mudd_emb=bool(int(os.environ.get('MUDD_EMB','0')));
 _logger_hparams=None
 def set_logging_hparams(h):global _logger_hparams;_logger_hparams=h
 def log(msg,console=True):
@@ -227,11 +230,15 @@ class MultiwayDynamicDenseBlock(nn.Module):
 		self.norm = RMSNorm()
 		if multiway:self.C = num_ways if not last_layer else 1
 		else:self.C = 1
-		self.lidx = lidx
+		self.lidx = lidx:
 		if local_window_size is None:l = base_layer + (lidx + 1) // k_dilation
 		else:l = local_window_size
 		self.local_window_size = local_window_size;hid_dim, out_dim = l * self.C, l * self.C;self.dim = dim;self.mudd_in_channels = mudd_in_channels or dim
-		self.w1 = CastedLinear(self.mudd_in_channels, hid_dim, bias=False);self.act = nn.GELU();self.w2 = CastedLinear(hid_dim, out_dim, bias=True);self.w2._zero_init = True;self.w2.bias.data.fill_(0.0)
+		self.w1 = CastedLinear(self.mudd_in_channels, hid_dim, bias=False);self.act = nn.GELU();self.w2 = CastedLinear(hid_dim, out_dim, bias=True);self.w2._zero_init = True
+		self.w2.bias.data.fill_(0.0)
+		backout = False
+		if lidx == 16 and backout:
+			self.w2.bias.data[-5].fill_(-0.5)
 		self.mudd_scale = 0.01 
 		self.channels = dim // 1;self.scale = nn.Parameter(torch.ones(self.channels * self.C, dtype=torch.float32)*self.mudd_scale)
 	def forward(self, x):
@@ -239,13 +246,23 @@ class MultiwayDynamicDenseBlock(nn.Module):
 		dw = self.w2(self.act(self.w1(x)))
 		dw = rearrange(dw, 'B T (C L) -> C B T L', C=self.C)
 		return dw
-	def layer_mix(self, x, all_hids, dw):
-		L = dw.shape[3];hids = all_hids[-L:];channels = self.channels;scale = self.scale.to(dtype=hids[0].dtype).view(self.C, 1, 1, -1)
-		norm = lambda x:x
-		weighted = dw[:, :, :, 0, None] * norm(hids[0][:, :, :channels])
-		for j in range(1, L):weighted = weighted + dw[:, :, :, j, None] * norm(hids[j][:, :, :channels])
+	def layer_mix(self, x, all_hids, dw, up_proj=None):
+		L = dw.shape[3]
+		if L == 1:
+			hids = all_hids[:1]
+		elif L > 2:
+			hids = all_hids[:1] + all_hids[-(L-2):] + all_hids[-1:]
+		else:
+			hids = all_hids[:1] + all_hids[-1:]
+		channels = self.channels;scale = self.scale.to(dtype=hids[0].dtype).view(self.C, 1, 1, -1)
+		weighted = dw[:, :, :, 0, None] * hids[0]
+		for j in range(1, L):weighted = weighted + dw[:, :, :, j, None] * hids[j]
 		normed = F.rms_norm(weighted, (weighted.size(-1),)) * scale
-		result = x + F.pad(normed, (0, hids[-1].size(-1) - channels))
+		result = normed	
+		if up_proj is not None:
+			result = up_proj(result)
+		# result = weighted * 0.001 / math.sqrt(L)
+		# result = x + F.pad(normed, (0, hids[-1].size(-1) - channels))
 		return tuple(result[c] for c in range(self.C)) if self.C > 1 else result[0]
 class CausalSelfAttention(nn.Module):
 	def __init__(self,dim,num_heads,num_kv_heads,rope_base,qk_gain_init,train_seq_len,use_kv_shift=False,attn_window_size=None,use_dcmha=False):
@@ -260,7 +277,7 @@ class CausalSelfAttention(nn.Module):
 		self.use_kv_shift=use_kv_shift
 		if use_kv_shift:self.kv_shift=CastedLinear(dim,num_kv_heads*2,bias=False);nn.init.zeros_(self.kv_shift.weight)
 	def _xsa_efficient(self,y,v):B,T,H,D=y.shape;Hkv=v.size(-2);group=H//Hkv;y_g=y.reshape(B,T,Hkv,group,D);vn=F.normalize(v,dim=-1).unsqueeze(-2);proj=(y_g*vn).sum(dim=-1,keepdim=True)*vn;return(y_g-proj).reshape(B,T,H,D)
-	def forward(self,x):
+	def forward(self,x, vway=None):
 		if isinstance(x, tuple):
 			if len(x) == 3:
 				xq, xk, xv = x
@@ -271,7 +288,21 @@ class CausalSelfAttention(nn.Module):
 		else:
 			bsz, seqlen, dim = x.shape
 			xq, xk, xv = x, x, x
-		q=self.c_q(xq).reshape(bsz,seqlen,self.num_heads,self.head_dim);k=self.c_k(xk).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim);v=self.c_v(xv).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
+		q=self.c_q(xq).reshape(bsz,seqlen,self.num_heads,self.head_dim);k=self.c_k(xk).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
+		vway_before_proj = False
+		if vway is not None and not vway_before_proj:
+			v= self.c_v(xv)
+			mode = 'v'
+			if mode == 'v':
+				v = v + vway[:,:,:v.shape[-1]] + vway[:,:,v.shape[-1]:] 
+			elif mode == 'kv':
+				v = v + vway[:,:,:v.shape[-1]]
+				k = k + vway[:,:,v.shape[-1]:] 
+		elif vway is not None and vway_before_proj:
+			v= self.c_v(xv + vway)
+		else:
+			v= self.c_v(xv)
+		v = v.reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
 		if self.use_kv_shift:
 			kg,vg=torch.sigmoid(self.kv_shift(xv)).reshape(bsz,seqlen,self.num_kv_heads,2).chunk(2,dim=-1)
 			k_prev=torch.cat([k[:,:1],k[:,:-1]],dim=1);v_prev=torch.cat([v[:,:1],v[:,:-1]],dim=1)
@@ -303,22 +334,42 @@ class CausalSelfAttention(nn.Module):
 		y=y.reshape(bsz,seqlen,dim);return self.proj(y)
 
 class MLP(nn.Module):
-	def __init__(self,dim,mlp_mult):super().__init__();hidden=int(mlp_mult*dim);self.fc=CastedLinear(dim,hidden,bias=False);self.proj=CastedLinear(hidden,dim,bias=False);self.proj._zero_init=True
+	def __init__(self,dim,mlp_mult, lidx=None, use_mudd=False):
+		super().__init__()
+		# if use_mudd:
+		# 	num_layers = 11; factor = lidx/(num_layers-1) + 0.5
+		# else:
+		factor = 1
+		hidden= int(mlp_mult*dim * factor)
+		# if lidx == 10:
+		# 	hidden += 512 + 256
+		self.fc=CastedLinear(dim,hidden,bias=False);self.proj=CastedLinear(hidden,dim,bias=False);self.proj._zero_init=True
 	def forward(self,x):return self.proj(F.leaky_relu(self.fc(x),negative_slope=.5).square())
 class Block(nn.Module):
-	def __init__(self,dim,num_heads,num_kv_heads,mlp_mult,rope_base,qk_gain_init,train_seq_len,layer_idx=0,ln_scale=False,use_kv_shift=False,use_mudd=False, attn_window_size=None,use_dcmha=False):
-		super().__init__();self.attn_norm=RMSNorm();self.mlp_norm=RMSNorm();self.attn=CausalSelfAttention(dim,num_heads,num_kv_heads,rope_base,qk_gain_init,train_seq_len,use_kv_shift=use_kv_shift,attn_window_size=attn_window_size,use_dcmha=use_dcmha);self.mlp=MLP(dim,mlp_mult);self.attn_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.mlp_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.resid_mix=nn.Parameter(torch.stack((torch.ones(dim),torch.zeros(dim))).float()) if not use_mudd else None
+	def __init__(self,dim,num_heads,num_kv_heads,mlp_mult,rope_base,qk_gain_init,train_seq_len,layer_idx=0,ln_scale=False,use_kv_shift=False,use_mudd=False, attn_window_size=None,use_dcmha=False, keep_unet=True):
+		super().__init__();self.attn_norm=RMSNorm();self.mlp_norm=RMSNorm()
+		rm4attn = False
+		if rm4attn and layer_idx == 4: # skip the 5th attention in the recurrent layer
+			self.attn = None 
+			self.attn_scale = 1
+		else:
+			self.attn=CausalSelfAttention(dim,num_heads,num_kv_heads,rope_base,qk_gain_init,train_seq_len,use_kv_shift=use_kv_shift,attn_window_size=attn_window_size,use_dcmha=use_dcmha)
+			self.attn_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32))
+		self.mlp=MLP(dim,mlp_mult, lidx=layer_idx, use_mudd=use_mudd)
+		self.mlp_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.resid_mix=nn.Parameter(torch.stack((torch.ones(dim),torch.zeros(dim))).float()) if keep_unet else None; self.keep_unet=keep_unet
 		# self.resid_mix = None
 
 		self.ln_scale_factor=1./math.sqrt(layer_idx+1)if ln_scale else 1.;self.parallel=False;self.use_mudd=use_mudd
-	def forward(self,x,x0, is_recurrent=False, looping_active=False):
+	def forward(self,x, x0, vm=None, is_recurrent=False, looping_active=False):
+		vway = None
 		if is_recurrent and not looping_active:
 			return x[-1] if isinstance(x, tuple) else x
-		if self.use_mudd:
+		if False and self.use_mudd and not self.keep_unet:
+			x = vm
 			if isinstance(x, tuple):
-				x_in = x[-1]
+				x_in = [-1]
 				normed_x = tuple([self.attn_norm(x_i) * self.ln_scale_factor for x_i in x[:-1]])
-			else:
+			else: # 1-way
 				x_in = x
 				normed_x = self.attn_norm(x_in) * self.ln_scale_factor
 		else:
@@ -327,78 +378,162 @@ class Block(nn.Module):
 			else:
 				mix=self.resid_mix.to(dtype=x.dtype)
 				x_in=mix[0][None,None,:]*x+mix[1][None,None,:]*x0
-			normed_x = self.attn_norm(x_in)*self.ln_scale_factor
-		attn_out=self.attn(normed_x)
-		if self.parallel:mlp_out=self.mlp(self.mlp_norm(x_in)*self.ln_scale_factor);x_out=x_in+self.attn_scale.to(dtype=x_in.dtype)[None,None,:]*attn_out+self.mlp_scale.to(dtype=x_in.dtype)[None,None,:]*mlp_out
-		else:x_out=x_in+self.attn_scale.to(dtype=x_in.dtype)[None,None,:]*attn_out;x_out=x_out+self.mlp_scale.to(dtype=x_out.dtype)[None,None,:]*self.mlp(self.mlp_norm(x_out)*self.ln_scale_factor)
+			if vm is not None:
+				vway_only = False
+				if isinstance(vm, tuple): # 2-way
+					vway = vm[0];normed_x = self.attn_norm(x_in)*self.ln_scale_factor
+					# normed_x = self.attn_norm(x_in+vm[0])*self.ln_scale_factor
+					x_in = x_in + vm[-1]
+				else: # 1-way
+					if vway_only:
+						vway = vm
+					else:
+						x_in = x_in + vm
+					normed_x = self.attn_norm(x_in)*self.ln_scale_factor
+			else:
+				normed_x = self.attn_norm(x_in)*self.ln_scale_factor
+		if self.attn is not None:
+			attn_out=self.attn(normed_x, vway=vway) * self.attn_scale.to(dtype=x_in.dtype)[None,None,:]
+		else:
+			attn_out = 0
+		if self.parallel:
+			mlp_out=self.mlp(self.mlp_norm(x_in)*self.ln_scale_factor)
+			x_out=x_in+attn_out+self.mlp_scale.to(dtype=x_in.dtype)[None,None,:]*mlp_out
+		else:
+			x_out=x_in+attn_out;x_out=x_out+self.mlp_scale.to(dtype=x_out.dtype)[None,None,:]*self.mlp(self.mlp_norm(x_out)*self.ln_scale_factor)
 		return x_out
 class GPT(nn.Module):
 	def __init__(self,h):
 		super().__init__()
 		if h.logit_softcap<=.0:raise ValueError(f"logit_softcap must be positive, got {h.logit_softcap}")
 		self.tie_embeddings=h.tie_embeddings;self.tied_embed_init_std=h.tied_embed_init_std;self.logit_softcap=h.logit_softcap;self.tok_emb=nn.Embedding(h.vocab_size,h.embedding_dim)
+		self.embedding_dim=h.embedding_dim
 		if h.embedding_dim!=h.model_dim:self.embed_proj=CastedLinear(h.embedding_dim,h.model_dim,bias=False);self.head_proj=CastedLinear(h.model_dim,h.embedding_dim,bias=False)
 		else:self.embed_proj=None;self.head_proj=None
 		self.use_mudd=h.use_mudd;self.use_kv_shift=h.use_kv_shift;self.use_dcmha=h.use_dcmha;self.num_layers=h.num_layers
 		self.num_encoder_layers=h.num_layers//2;self.num_decoder_layers=h.num_layers-self.num_encoder_layers
 		attn_window_sizes=[None]*h.num_layers
 		if h.use_dcmha:attn_window_sizes=[256,None,256,256]*3
-		self.blocks=nn.ModuleList([Block(h.model_dim,h.num_heads,h.num_kv_heads,h.mlp_mult,h.rope_base,h.qk_gain_init,h.train_seq_len,layer_idx=i,ln_scale=h.ln_scale,use_kv_shift=h.use_kv_shift,use_mudd=h.use_mudd, attn_window_size=attn_window_sizes[i],use_dcmha=h.use_dcmha and attn_window_sizes[i] is not None)for i in range(h.num_layers)])
+		self.blocks=nn.ModuleList([Block(h.model_dim,h.num_heads,h.num_kv_heads,h.mlp_mult,h.rope_base,h.qk_gain_init,h.train_seq_len,layer_idx=i,ln_scale=h.ln_scale,use_kv_shift=h.use_kv_shift,use_mudd=h.use_mudd, attn_window_size=attn_window_sizes[i],use_dcmha=h.use_dcmha and attn_window_sizes[i] is not None, keep_unet=h.keep_unet)for i in range(h.num_layers)])
 		if h.rope_dims>0:
 			head_dim=h.model_dim//h.num_heads
-			for block in self.blocks:block.attn.rope_dims=h.rope_dims;block.attn.rotary=Rotary(head_dim,base=h.rope_base,train_seq_len=h.train_seq_len,rope_dims=h.rope_dims)
+			for block in self.blocks:
+				if block.attn is not None:
+					block.attn.rope_dims=h.rope_dims;block.attn.rotary=Rotary(head_dim,base=h.rope_base,train_seq_len=h.train_seq_len,rope_dims=h.rope_dims)
 		self.final_norm=RMSNorm();self.lm_head=None if h.tie_embeddings else CastedLinear(h.embedding_dim,h.vocab_size,bias=False)
 		if self.lm_head is not None:self.lm_head._zero_init=True
 		if h.xsa_last_n>0:
-			for i in range(max(0,h.num_layers-h.xsa_last_n),h.num_layers):self.blocks[i].attn.use_xsa=True
+			for i in range(max(0,h.num_layers-h.xsa_last_n),h.num_layers):
+				if self.blocks[i].attn is not None:
+					self.blocks[i].attn.use_xsa=True
 		if h.parallel_residual_start>=0:
 			for i in range(h.parallel_residual_start,h.num_layers):self.blocks[i].parallel=True
 		self.looping_active=False
 		# if self.use_mudd:
 		# 	self.looping_active=True
-		self.is_recur_indices = [False] * (h.num_layers + h.num_loops* (h.loop_end- h.loop_start))
+		self.is_recur_indices = [False] * (h.num_layers + h.num_loops* (h.loop_end- h.loop_start+1))
 		if h.num_loops>0:
 			loop_seg=list(range(h.loop_start,h.loop_end+1));all_indices=list(range(h.loop_start))
 			for _ in range(h.num_loops+1):all_indices.extend(loop_seg)
 			all_indices.extend(range(h.loop_end+1,h.num_layers));num_enc=len(all_indices)//2;self.encoder_indices=all_indices[:num_enc];self.decoder_indices=all_indices[num_enc:]
-			is_recur_indices = []
-			for i,j in enumerate(all_indices):
-				if i==0:
-					is_recur_indices.append(False)
-				else:
-					is_recur_indices.append(j in all_indices[:i-1])
-			self.is_recur_indices = is_recur_indices
-			print('is_recur_indices', is_recur_indices)
-			print('all_indices', all_indices)
-			print('encoder_indices', self.encoder_indices)
-			print('decoder_indices', self.decoder_indices)
+			if h.use_mudd:
+				is_recur_indices = []
+				for i,j in enumerate(all_indices):
+					if i==0:
+						is_recur_indices.append(False)
+					else:
+						is_recur_indices.append(j in all_indices[:i-1])
+				self.is_recur_indices = is_recur_indices
+				print('is_recur_indices', is_recur_indices)
+				print('all_indices', all_indices)
+				print('encoder_indices', self.encoder_indices)
+				print('decoder_indices', self.decoder_indices)
 		else:self.encoder_indices=list(range(self.num_encoder_layers));self.decoder_indices=list(range(self.num_encoder_layers,h.num_layers))
 		self.num_skip_weights=min(len(self.encoder_indices),len(self.decoder_indices))
 		use_mudd = h.use_mudd
 		# use_mudd = True # hack skip weights
-		self.skip_weights=nn.Parameter(torch.ones(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if not use_mudd else None
-		self.skip_gates=nn.Parameter(torch.zeros(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if h.skip_gates_enabled and not use_mudd else None
+		self.skip_weights=nn.Parameter(torch.ones(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if h.keep_unet else None
+		self.skip_gates=nn.Parameter(torch.zeros(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if h.skip_gates_enabled and h.keep_unet else None
 		# self.skip_weights = None # hack skip weights
 		# self.skip_gates = None # hack skip gates
 		if h.use_mudd:
+			self.num_mudd_embs = 2
+			self.mudd_emb = nn.Embedding(h.vocab_size,h.embedding_dim * self.num_mudd_embs) if h.mudd_emb else None
+			self.mudd_compress = h.mudd_compress
+			# if self.mudd_compress:
+			# 	lora_dim = h.model_dim//4
+			# 	self.mudd_down = CastedLinear(h.model_dim, lora_dim, bias=False)
+			# 	self.mudd_up = CastedLinear(lora_dim, h.model_dim, bias=False)
+			# else:
+			# 	self.mudd_down = lambda x: x
+			# 	self.mudd_up = lambda x: x
 			looped_num_layers = len(all_indices)
 			# self.num_ways = [4] * looped_num_layers
 			# self.num_ways = [4, 1, 1, 1] * looped_num_layers
 			# self.mudd_skip_indices = list(range(8))
 			self.mudd_skip_indices = []
-			self.num_ways = [1]*8+[1,1,4,1]*3
+			# self.num_ways = [1]*8+[1,1,4,1]*3
 			self.mudd_q_dilation=h.mudd_q_dilation;self.mudd_k_dilation=h.mudd_k_dilation;self.mudd_in_channels=h.model_dim
 			# local_window_sizes=[None]*looped_num_layers
-			# local_window_sizes=[2]*8 + [2, None, None,None]*looped_num_layers
-			local_window_sizes= [2, None, None,None]*looped_num_layers
-			num_base_layers=1
-			self.dynamic_dense=nn.ModuleList([MultiwayDynamicDenseBlock(h.model_dim,i,last_layer=i==looped_num_layers-1,multiway=True,q_dilation=self.mudd_q_dilation,k_dilation=self.mudd_k_dilation,base_layer=num_base_layers,mudd_in_channels=self.mudd_in_channels,num_ways=self.num_ways[i],local_window_size=local_window_sizes[i]) if (i%self.mudd_q_dilation==0 or i==looped_num_layers-1) and i not in self.mudd_skip_indices else None for i in range(looped_num_layers)])
+			# local_window_sizes=[2]*12 + [2,2,2,None,None]# [None, None, None,None]*looped_num_layers
+			num_base_layers=1 if self.mudd_emb is None else 2
+			# self.mudd_q_indices = [2, 4,  8, 1
+			# 0, 14,15,16]
+			mode = 'mudd_base'
+			if mode == 'mudd_base':
+				self.num_ways = [1]*12 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2, None, None,None]*looped_num_layers
+			elif mode == 'mudd_base2':
+				self.num_ways = [1]*12 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [None, None, 2,None]*looped_num_layers
+			elif mode == 'mudd_base_lite2':
+				self.num_ways = [1]*15 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2]*8 + [None, None, 2,None]*looped_num_layers
+			elif mode == 'mudd_base_lite3':
+				self.num_ways = [1]*12 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2]*10 + [None, None, 2,None]*looped_num_layers
+			elif mode == 'mudd_base_lite4': 
+				self.num_ways = [1]*15 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2, None, None,None]*looped_num_layers
+			elif mode == 'mudd_base_lite5':
+				self.num_ways = [1]*8 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2, None, None,None]*looped_num_layers
+			elif mode == 'mudd_base_lite6':
+				self.num_ways = [1]*12 + [2] * looped_num_layers
+				self.mudd_q_indices = [0, 1, 2, 14, 15, 16]
+				# self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2, None, None,None]*3 + [2, 2, 2, None,None]
+			elif mode == 'mudd_vway_only':
+				self.num_ways = [1]* looped_num_layers
+				self.mudd_q_indices = [15,16]
+				local_window_sizes = [None]*looped_num_layers
+			elif mode == 'mudd_vway_only15':
+				self.num_ways = [1]* looped_num_layers
+				self.mudd_q_indices = [15]
+				local_window_sizes = [None]*looped_num_layers
+			elif mode == 'mudd_vway_only16':
+				self.num_ways = [1]* looped_num_layers
+				self.mudd_q_indices = [16]
+				local_window_sizes = [None]*looped_num_layers
+			elif mode == 'mudd_q_all':
+				self.mudd_q_indices = list(range(looped_num_layers))
+				local_window_sizes = [1] * 8 + [2, 1, None,1] + [2, 1, None,None] + [None, None] #*looped_num_layers # first 8 layers and even layers mix x0 only; 
+				self.num_ways = [1]*12 + [2, 1] * looped_num_layers
+
+			self.dynamic_dense=nn.ModuleList([MultiwayDynamicDenseBlock(h.model_dim,i,last_layer=i==looped_num_layers-1,multiway=True,q_dilation=self.mudd_q_dilation,k_dilation=self.mudd_k_dilation,base_layer=num_base_layers,mudd_in_channels=self.mudd_in_channels,num_ways=self.num_ways[i],local_window_size=local_window_sizes[i]) if i in self.mudd_q_indices else None for i in range(looped_num_layers)])
 		else:self.dynamic_dense=nn.ModuleList()
 		if h.mudd_prenorm:self.mudd_prenorm=RMSNorm()
 		else:self.mudd_prenorm=lambda x:x
 		self._init_weights()
 	def _init_weights(self):
 		if self.tie_embeddings:nn.init.normal_(self.tok_emb.weight,mean=.0,std=self.tied_embed_init_std)
+		if self.mudd_emb:nn.init.normal_(self.mudd_emb.weight,mean=.0,std=self.tied_embed_init_std)
 		for(name,module)in self.named_modules():
 			if isinstance(module,nn.Linear):
 				if getattr(module,'_zero_init',False):nn.init.zeros_(module.weight)
@@ -409,32 +544,49 @@ class GPT(nn.Module):
 		x=self.tok_emb(input_ids);x=F.rms_norm(x,(x.size(-1),))
 		if self.embed_proj is not None:x=self.embed_proj(x)
 		x0=x;hiddens=[];skips=[];enc_iter=self.encoder_indices if self.looping_active or self.use_mudd else range(self.num_encoder_layers);dec_iter=self.decoder_indices if self.looping_active or self.use_mudd else range(self.num_encoder_layers,self.num_encoder_layers+self.num_decoder_layers)
-		if self.use_mudd:hiddens.append(self.mudd_prenorm(x))
+		if self.mudd_emb is not None: 
+			mudd_embs = self.mudd_emb(input_ids)
+			for i in range(self.num_mudd_embs):
+				hiddens.append(F.rms_norm(mudd_embs[:,:,i*self.embedding_dim:(i+1)*self.embedding_dim],(self.embedding_dim,)))
+		if self.use_mudd:hiddens.append(x)
 		mudd_idx=0;looped_num_layers=len(enc_iter)+len(dec_iter) if self.use_mudd else 0
+		vm = None # value and mlp way
 		for _idx, i in enumerate(enc_iter):
-			x=self.blocks[i](x,x0, is_recurrent=self.is_recur_indices[_idx], looping_active=self.looping_active)
-			if not self.use_mudd:
+			x=self.blocks[i](x,x0, vm=vm, is_recurrent=self.is_recur_indices[_idx], looping_active=self.looping_active)
+			# if not self.use_mudd:
+			if self.skip_weights is not None:
 				skips.append(x)
 			if self.use_mudd:
-				if mudd_idx%self.mudd_k_dilation==0:hiddens.append(self.mudd_prenorm(x))
-				if mudd_idx%self.mudd_q_dilation==0 and mudd_idx not in self.mudd_skip_indices:
-					dw=self.dynamic_dense[mudd_idx](x);mixed=self.dynamic_dense[mudd_idx].layer_mix(x,hiddens,dw);x=mixed
+				if mudd_idx%self.mudd_k_dilation==0:hiddens.append(x)
+				# if mudd_idx%self.mudd_q_dilation==0 and mudd_idx not in self.mudd_skip_indices:
+				if mudd_idx in self.mudd_q_indices:
+					dw=self.dynamic_dense[mudd_idx](x);mixed=self.dynamic_dense[mudd_idx].layer_mix(x,hiddens,dw)
+					vm=mixed
+				else:
+					vm=None
 				mudd_idx+=1
 		        # print('enc_iter', i, mudd_idx-1)
 		for(skip_idx,i)in enumerate(dec_iter):
-			if not self.use_mudd and skip_idx<self.num_skip_weights and skips and self.skip_weights is not None:
+			if self.skip_weights is not None and skip_idx<self.num_skip_weights and skips and (not self.is_recur_indices[skip_idx+len(enc_iter)] or self.looping_active):
 				scaled_skip=self.skip_weights[skip_idx].to(dtype=x.dtype)[None,None,:]*skips.pop()
 				if self.skip_gates is not None:g=torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None,None,:];x=torch.lerp(scaled_skip,x,g)
 				else:x=x+scaled_skip
-			x=self.blocks[i](x,x0, is_recurrent=self.is_recur_indices[skip_idx+len(enc_iter)], looping_active=self.looping_active)
-			typex= type(x)
+			# print('skip_idx', skip_idx, 'i', i)
+			x=self.blocks[i](x,x0, is_recurrent=self.is_recur_indices[skip_idx+len(enc_iter)], looping_active=self.looping_active, vm=vm)
 			if self.use_mudd:
-				if mudd_idx%self.mudd_k_dilation==0:hiddens.append(self.mudd_prenorm(x))
-				if (mudd_idx%self.mudd_q_dilation==0 and mudd_idx not in self.mudd_skip_indices) or mudd_idx==looped_num_layers-1:
-					dw=self.dynamic_dense[mudd_idx](x);mixed=self.dynamic_dense[mudd_idx].layer_mix(x,hiddens,dw);x=mixed
+				# assert self.mudd_k_dilation==2
+				if mudd_idx%self.mudd_k_dilation==0:
+					hiddens.append(x)
+				if mudd_idx in self.mudd_q_indices:
+					dw=self.dynamic_dense[mudd_idx](x);mixed=self.dynamic_dense[mudd_idx].layer_mix(x,hiddens,dw)
+					vm=mixed
+				else:
+					vm=None
 				mudd_idx+=1
 				# print('dec_iter', i, mudd_idx-1)
 			# print(i, mudd_idx, typex,type(x), self.is_recur_indices[skip_idx+len(enc_iter)])
+		if vm is not None:
+			x = vm + x # add residual connection
 		x=self.final_norm(x)
 		if self.head_proj is not None:x=self.head_proj(x)
 		if self.tie_embeddings:logits_proj=F.linear(x,self.tok_emb.weight)
@@ -442,7 +594,7 @@ class GPT(nn.Module):
 		return self.logit_softcap*torch.tanh(logits_proj/self.logit_softcap)
 	def forward(self,input_ids,target_ids):logits=self.forward_logits(input_ids);return F.cross_entropy(logits.reshape(-1,logits.size(-1)).float(),target_ids.reshape(-1),reduction='mean')
 def classify_param(name):
-	if'tok_emb'in name or'lm_head'in name:return'embed'
+	if'tok_emb'in name or'lm_head'in name or'mudd_emb'in name:return'embed'
 	if'.mlp.'in name:return'mlp'
 	if'.attn.'in name or'.proj.'in name and'.mlp.'not in name:return'attn'
 	return'other'
@@ -499,8 +651,12 @@ class Optimizers:
 			for block in base_model.blocks:
 				if block.attn.use_kv_shift:kv_shift_params.extend([block.attn.kv_shift.weight])
 			scalar_params.extend(kv_shift_params)
-		scalar_params.extend(mudd_scalar_params+mudd_matrix_params)
-		token_lr=h.tied_embed_lr if h.tie_embeddings else h.embed_lr;tok_params=[{'params':[base_model.tok_emb.weight],'lr':token_lr,'base_lr':token_lr}];self.optimizer_tok=torch.optim.AdamW(tok_params,betas=(h.beta1,h.beta2),eps=h.adam_eps,weight_decay=h.embed_wd,fused=True);self.optimizer_muon=Muon(matrix_params,lr=h.matrix_lr,momentum=h.muon_momentum,backend_steps=h.muon_backend_steps,weight_decay=h.muon_wd,row_normalize=h.muon_row_normalize)
+		if h.mudd_muon:
+			matrix_params.extend(mudd_matrix_params)
+			scalar_params.extend(mudd_scalar_params)
+		else:
+			scalar_params.extend(mudd_scalar_params+mudd_matrix_params)
+		token_lr=h.tied_embed_lr if h.tie_embeddings else h.embed_lr;tok_params=[{'params':[base_model.tok_emb.weight]+([base_model.mudd_emb.weight] if base_model.mudd_emb is not None else []),'lr':token_lr,'base_lr':token_lr}];self.optimizer_tok=torch.optim.AdamW(tok_params,betas=(h.beta1,h.beta2),eps=h.adam_eps,weight_decay=h.embed_wd,fused=True);self.optimizer_muon=Muon(matrix_params,lr=h.matrix_lr,momentum=h.muon_momentum,backend_steps=h.muon_backend_steps,weight_decay=h.muon_wd,row_normalize=h.muon_row_normalize)
 		for group in self.optimizer_muon.param_groups:group['base_lr']=h.matrix_lr
 		self.optimizer_scalar=torch.optim.AdamW([{'params':scalar_params,'lr':h.scalar_lr,'base_lr':h.scalar_lr}],betas=(h.beta1,h.beta2),eps=h.adam_eps,weight_decay=h.adam_wd,fused=True);self.optimizers=[self.optimizer_tok,self.optimizer_muon,self.optimizer_scalar]
 		if base_model.lm_head is not None:self.optimizer_head=torch.optim.Adam([{'params':[base_model.lm_head.weight],'lr':h.head_lr,'base_lr':h.head_lr}],betas=(h.beta1,h.beta2),eps=h.adam_eps,fused=True);self.optimizers.insert(1,self.optimizer_head)
@@ -687,7 +843,7 @@ def train_model(h,device,val_data):
 		if h.use_mudd:
 			for block in base_model.dynamic_dense:
 				if block is not None:
-					print('mudd lidx', block.lidx, 'num_ways', block.C, 'local_window_size', block.local_window_size, 'channels', block.channels, 'scale', block.mudd_scale)
+					print('mudd lidx', block.lidx, 'num_ways', block.C, 'local_window_size', block.local_window_size, 'channels', block.channels, 'scale', block.mudd_scale, 'k_components', block.w2.weight.shape[0]//block.C)
 	log(f"model_params:{sum(p.numel()for p in base_model.parameters())}");optimizers=Optimizers(h,base_model);train_loader=ShuffledSequenceLoader(h,device);tb_writer=None
 	if h.tensorboard_dir and h.is_main_process: tensorboard_dir=os.path.join(h.tensorboard_dir,h.run_id);os.makedirs(tensorboard_dir,exist_ok=True);tb_writer=SummaryWriter(log_dir=tensorboard_dir)
 	max_wallclock_ms=1e3*h.max_wallclock_seconds if h.max_wallclock_seconds>0 else None
@@ -707,6 +863,18 @@ def train_model(h,device,val_data):
 			with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):loss=model(x,y)
 			train_loss+=loss.detach();(loss/h.grad_accum_steps).backward()
 		train_loss/=h.grad_accum_steps;frac=min(step/h.muon_momentum_warmup_steps,1.)if h.muon_momentum_warmup_steps>0 else 1.;muon_momentum=(1-frac)*h.muon_momentum_warmup_start+frac*h.muon_momentum
+
+        # find unused parameters
+		# if h.is_main_process and step == 0:
+		# 	unused = [
+		# 		name for name, p in base_model.named_parameters()
+		# 		if p.requires_grad and p.grad is None
+		# 	]
+		# 	if unused:
+		# 		print("unused params (requires_grad, grad is None after step backward):")
+		# 		for name in unused:
+		# 			print(" ", name)
+
 		for group in optimizers.optimizer_muon.param_groups:group['momentum']=muon_momentum
 		for opt in optimizers:
 			for group in opt.param_groups:group['lr']=group['base_lr']*lr_scale
@@ -732,7 +900,7 @@ def train_model(h,device,val_data):
 		train_loader=ShuffledSequenceLoader(h,device)
 	ema_state={name:t.detach().float().clone()for(name,t)in base_model.state_dict().items()};ema_decay=h.ema_decay;training_time_ms=.0;stop_after_step=None;torch.cuda.synchronize();t0=time.perf_counter();step=0
 	while True:
-		last_step=step==h.iterations or stop_after_step is not None and step>=stop_after_step;should_validate=last_step or h.val_loss_every>0 and step%h.val_loss_every==0
+		last_step=step==h.iterations or stop_after_step is not None and step>=stop_after_step;should_validate=last_step or h.val_loss_every>0 and step%h.val_loss_every==0 and step>0
 		if should_validate:
 			torch.cuda.synchronize();training_time_ms+=1e3*(time.perf_counter()-t0);val_loss,val_bpb=eval_val(h,device,val_data,model);log(f"{step}/{h.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}")
 			if tb_writer is not None:tb_writer.add_scalar('val/loss',val_loss,step);tb_writer.add_scalar('val/bpb',val_bpb,step)
@@ -746,7 +914,7 @@ def train_model(h,device,val_data):
 		with torch.no_grad():
 			for(name,t)in base_model.state_dict().items():ema_state[name].mul_(ema_decay).add_(t.detach().float(),alpha=1.-ema_decay)
 		step+=1;approx_training_time_ms=training_time_ms+1e3*(time.perf_counter()-t0);should_log_train=h.train_log_every>0 and(step<=5 or step%h.train_log_every==0 or stop_after_step is not None)
-		if should_log_train:tok_per_sec=step*h.train_batch_tokens/(approx_training_time_ms/1e3);log(f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m, step_avg: {approx_training_time_ms/step:.2f}ms, raw_grad_norm: {raw_grad_norm:.4f}, tok/s: {tok_per_sec:.0f}")
+		if should_log_train:tok_per_sec=step*h.train_batch_tokens/(approx_training_time_ms/1e3);log(f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m, step_avg: {approx_training_time_ms/step:.2f}ms, raw_grad_norm: {raw_grad_norm:.4f}, tok/s: {tok_per_sec:.0f}")#;log(f'scale: {[m.scale.mean().item() for m in base_model.dynamic_dense if m is not None]}')
 		if tb_writer is not None and should_log_train:tb_writer.add_scalar('train/loss',train_loss.item(),step);tb_writer.add_scalar('train/raw_grad_norm',float(raw_grad_norm),step);tb_writer.add_scalar('train/learning_rate',cur_lr,step); tb_writer.add_scalar('perf/step_avg_ms',approx_training_time_ms/step,step)
 		reached_cap=max_wallclock_ms is not None and approx_training_time_ms>=max_wallclock_ms
 		if h.distributed and max_wallclock_ms is not None:reached_cap_tensor=torch.tensor(int(reached_cap),device=device);dist.all_reduce(reached_cap_tensor,op=dist.ReduceOp.MAX);reached_cap=bool(reached_cap_tensor.item())
