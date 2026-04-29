@@ -134,6 +134,7 @@ torchrun --standalone --nproc_per_node=2 train_gpt0409.py
 # mudd_multiway_q2k1_scale0p1_kvshift
 
 # mudd_multiway_q2k1_ch2_reproduce
+# torch._inductor.config.force_disable_caches = True
 
 # full train 
 
@@ -143,14 +144,26 @@ USE_KV_SHIFT=0 USE_DCMHA=0 USE_MUDD=1 MUDD_Q_DILATION=2 MUDD_K_DILATION=2 \
 torchrun --standalone --nproc_per_node=8 train_gpt0409.py
 
 
-NCCL_NET=Socket NCCL_DEBUG=WARN SEED=423 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
-RUN_ID=baseline0409_mudd_qdil2kdil2_2way_vway_base8_vbeforeproj_matched_params_seed423 TENSORBOARD_DIR='' WARMUP_STEPS=150 \
+TORCHINDUCTOR_CACHE_DIR=./triton_cache NCCL_NET=Socket NCCL_DEBUG=WARN SEED=423 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
+RUN_ID=baseline0409_mudd_qdil2kdil2_2way_vway_base6_vbeforeproj_matched_params_seed423_mha_emb TENSORBOARD_DIR='' WARMUP_STEPS=150 \
 USE_KV_SHIFT=0 USE_DCMHA=0 USE_MUDD=1 MUDD_Q_DILATION=2 MUDD_K_DILATION=1 \
 TRAIN_BATCH_TOKENS=786432 MAX_WALLCLOCK_SECONDS=600 \
-KEEP_UNET=0 NUM_LAYERS=11 MUDD_EMB=0 MLP_MULT=4 \
+KEEP_UNET=0 NUM_LAYERS=11 MUDD_EMB=1 MLP_MULT=2.78 NUM_KV_HEADS=8 \
 torchrun --standalone --nproc_per_node=8 train_gpt0409.py
 
+# sota: val_loss: 2.8037 val_bpb: 1.0854; quantized_ttt val_loss:2.78099004 val_bpb:1.07660791
+# TORCHINDUCTOR_CACHE_DIR=./triton_cache NCCL_NET=Socket NCCL_DEBUG=WARN SEED=423 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
+# RUN_ID=baseline0409_mudd_qdil2kdil2_2way_vway_base6_vbeforeproj_matched_params_seed423_mha TENSORBOARD_DIR='' WARMUP_STEPS=150 \
+# USE_KV_SHIFT=0 USE_DCMHA=0 USE_MUDD=1 MUDD_Q_DILATION=2 MUDD_K_DILATION=1 \
+# TRAIN_BATCH_TOKENS=786432 MAX_WALLCLOCK_SECONDS=600 \
+# KEEP_UNET=0 NUM_LAYERS=11 MUDD_EMB=0 MLP_MULT=3.5 NUM_KV_HEADS=8 \
+# torchrun --standalone --nproc_per_node=8 train_gpt0409.py
 
+
+# dilated muddformer 
+TORCHINDUCTOR_CACHE_DIR=./triton_cache NCCL_NET=Socket NCCL_DEBUG=WARN SEED=423 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
+RUN_ID=baseline0409_mudd_seed423  USE_MUDD=1 KEEP_UNET=0 MLP_MULT=3.5 NUM_KV_HEADS=8  WARMUP_STEPS=150 TENSORBOARD_DIR=''  \
+torchrun --standalone --nproc_per_node=8 train_gpt0409.py
 
 NCCL_NET=Socket NCCL_DEBUG=WARN SEED=42 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
 RUN_ID=baseline0409_660s MAX_WALLCLOCK_SECONDS=660 \
@@ -171,3 +184,71 @@ torchrun --standalone --nproc_per_node=8 train_gpt0409_base.py
 NCCL_NET=Socket NCCL_DEBUG=WARN SEED=42 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
 RUN_ID=baseline0409_420s MAX_WALLCLOCK_SECONDS=420 \
 torchrun --standalone --nproc_per_node=8 train_gpt0409_base.py
+
+
+# configs 
+if mode == 'mudd_base':
+				self.num_ways = [1]*12 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2, None, None,None]*looped_num_layers
+			elif mode == 'mudd_base2':
+				self.num_ways = [1]*12 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [None, None, 2,None]*looped_num_layers
+			elif mode == 'mudd_base3':
+				self.num_ways = [1]*8 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [None, None, 2,None]*looped_num_layers
+			elif mode == 'mudd_base5':
+				self.num_ways = [1]*12 + [2] * looped_num_layers
+				self.mudd_q_indices = [2,4,6,8,10,13,15,16]#list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [None, None, 2,None]*looped_num_layers
+			elif mode == 'mudd_base6':
+				self.num_ways = [1]*12 + [2] * looped_num_layers
+				self.mudd_q_indices = [2,4,6,8,10,12,15,16]
+				local_window_sizes= [None, None, 2,None]*looped_num_layers
+			elif mode == 'mudd_base7':
+				self.num_ways = [1]*12 + [3] * looped_num_layers
+				self.mudd_q_indices = [2,4,6,8,10,12,15,16]
+				local_window_sizes= [None, None, 2,None]*looped_num_layers
+			elif mode == 'mudd_base8':
+				self.num_ways = [1]*12 + [3] + [2] * looped_num_layers
+				self.mudd_q_indices = [2,4,6,8,10,12,15,16]
+				local_window_sizes= [None, None, 2,None]*looped_num_layers
+			elif mode == 'mudd_base_lite2':
+				self.num_ways = [1]*15 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2]*8 + [None, None, 2,None]*looped_num_layers
+			elif mode == 'mudd_base_lite3':
+				self.num_ways = [1]*12 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2]*10 + [None, None, 2,None]*looped_num_layers
+			elif mode == 'mudd_base_lite4': 
+				self.num_ways = [1]*15 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2, None, None,None]*looped_num_layers
+			elif mode == 'mudd_base_lite5':
+				self.num_ways = [1]*8 + [2] * looped_num_layers
+				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2, None, None,None]*looped_num_layers
+			elif mode == 'mudd_base_lite6':
+				self.num_ways = [1]*12 + [2] * looped_num_layers
+				self.mudd_q_indices = [0, 1, 2, 14, 15, 16]
+				# self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
+				local_window_sizes= [2, None, None,None]*3 + [2, 2, 2, None,None]
+			elif mode == 'mudd_vway_only':
+				self.num_ways = [1]* looped_num_layers
+				self.mudd_q_indices = [15,16]
+				local_window_sizes = [None]*looped_num_layers
+			elif mode == 'mudd_vway_only15':
+				self.num_ways = [1]* looped_num_layers
+				self.mudd_q_indices = [15]
+				local_window_sizes = [None]*looped_num_layers
+			elif mode == 'mudd_vway_only16':
+				self.num_ways = [1]* looped_num_layers
+				self.mudd_q_indices = [16]
+				local_window_sizes = [None]*looped_num_layers
+			elif mode == 'mudd_q_all':
+				self.mudd_q_indices = list(range(looped_num_layers))
+				local_window_sizes = [1] * 8 + [2, 1, None,1] + [2, 1, None,None] + [None, None] #*looped_num_layers # first 8 layers and even layers mix x0 only; 
+				self.num_ways = [1]*12 + [2, 1] * looped_num_layers

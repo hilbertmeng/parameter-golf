@@ -245,6 +245,11 @@ class GPT(nn.Module):
 		self.skip_weights=nn.Parameter(torch.ones(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if h.keep_unet else None
 		self.skip_gates=nn.Parameter(torch.zeros(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if h.skip_gates_enabled and h.keep_unet else None
 		if h.use_mudd:
+			if h.mudd_emb:
+				self.num_mudd_embs = 1
+				self.mudd_emb = nn.Embedding(h.vocab_size,h.embedding_dim * self.num_mudd_embs) 
+			else:
+				self.mudd_emb = None
 			looped_num_layers = len(all_indices)
 			self.mudd_q_dilation=h.mudd_q_dilation
 			self.mudd_k_dilation=h.mudd_k_dilation
@@ -253,9 +258,6 @@ class GPT(nn.Module):
 			self.mudd_q_indices = [2,4,6,8,10,12,15,16]
 			local_window_sizes= [None, None, 2,None]*5
 			self.dynamic_dense=nn.ModuleList([MultiwayDynamicDenseBlock(h.model_dim,i,last_layer=i==looped_num_layers-1,multiway=True,k_dilation=self.mudd_k_dilation,base_layer=num_base_layers,num_ways=self.num_ways[i],local_window_size=local_window_sizes[i]) if i in self.mudd_q_indices else None for i in range(looped_num_layers)])
-		    if h.mudd_emb:
-				self.num_mudd_embs = 1
-				self.mudd_emb = nn.Embedding(h.vocab_size,h.embedding_dim * self.num_mudd_embs) 
 		else:self.dynamic_dense=nn.ModuleList()
 		self._init_weights()
 	def _init_weights(self):
