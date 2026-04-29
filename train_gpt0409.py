@@ -9,9 +9,8 @@ from einops import rearrange
 from typing import Optional, Tuple
 
 import lzma, base64
-# torch._inductor.config.force_disable_caches = True
 
-class Hyperparameters:data_dir=os.environ.get('DATA_DIR','./data/');seed=int(os.environ.get('SEED',1337));run_id=os.environ.get('RUN_ID',str(uuid.uuid4()));iterations=int(os.environ.get('ITERATIONS',20000));warmdown_frac=float(os.environ.get('WARMDOWN_FRAC',.72));warmup_steps=int(os.environ.get('WARMUP_STEPS',20));train_batch_tokens=int(os.environ.get('TRAIN_BATCH_TOKENS',786432));train_seq_len=int(os.environ.get('TRAIN_SEQ_LEN',2048));train_log_every=int(os.environ.get('TRAIN_LOG_EVERY',500));max_wallclock_seconds=float(os.environ.get('MAX_WALLCLOCK_SECONDS',6e2));val_batch_tokens=int(os.environ.get('VAL_BATCH_TOKENS',524288));eval_seq_len=int(os.environ.get('EVAL_SEQ_LEN',2048));val_loss_every=int(os.environ.get('VAL_LOSS_EVERY',4000));sliding_window_enabled=bool(int(os.environ.get('SLIDING_WINDOW_ENABLED','1')));vocab_size=int(os.environ.get('VOCAB_SIZE',8192));num_layers=int(os.environ.get('NUM_LAYERS',11));xsa_last_n=int(os.environ.get('XSA_LAST_N',11));model_dim=int(os.environ.get('MODEL_DIM',512));embedding_dim=int(os.environ.get('EMBEDDING_DIM',512));num_kv_heads=int(os.environ.get('NUM_KV_HEADS',4));num_heads=int(os.environ.get('NUM_HEADS',8));mlp_mult=float(os.environ.get('MLP_MULT',4.));skip_gates_enabled=bool(int(os.environ.get('SKIP_GATES_ENABLED','1')));tie_embeddings=bool(int(os.environ.get('TIE_EMBEDDINGS','1')));logit_softcap=float(os.environ.get('LOGIT_SOFTCAP',3e1));rope_base=float(os.environ.get('ROPE_BASE',1e4));rope_dims=int(os.environ.get('ROPE_DIMS',16));rope_train_seq_len=int(os.environ.get('ROPE_TRAIN_SEQ_LEN',2048));ln_scale=bool(int(os.environ.get('LN_SCALE','1')));qk_gain_init=float(os.environ.get('QK_GAIN_INIT',5.));num_loops=int(os.environ.get('NUM_LOOPS',2));loop_start=int(os.environ.get('LOOP_START',3));loop_end=int(os.environ.get('LOOP_END',5));enable_looping_at=float(os.environ.get('ENABLE_LOOPING_AT',.35));parallel_residual_start=int(os.environ.get('PARALLEL_RESIDUAL_START',7));min_lr=float(os.environ.get('MIN_LR',.0));embed_lr=float(os.environ.get('EMBED_LR',.6));head_lr=float(os.environ.get('HEAD_LR',.008));tied_embed_lr=float(os.environ.get('TIED_EMBED_LR',.03));tied_embed_init_std=float(os.environ.get('TIED_EMBED_INIT_STD',.005));matrix_lr=float(os.environ.get('MATRIX_LR',.022));scalar_lr=float(os.environ.get('SCALAR_LR',.02));muon_momentum=float(os.environ.get('MUON_MOMENTUM',.99));muon_backend_steps=int(os.environ.get('MUON_BACKEND_STEPS',5));muon_momentum_warmup_start=float(os.environ.get('MUON_MOMENTUM_WARMUP_START',.92));muon_momentum_warmup_steps=int(os.environ.get('MUON_MOMENTUM_WARMUP_STEPS',1500));muon_row_normalize=bool(int(os.environ.get('MUON_ROW_NORMALIZE','1')));beta1=float(os.environ.get('BETA1',.9));beta2=float(os.environ.get('BETA2',.95));adam_eps=float(os.environ.get('ADAM_EPS',1e-08));grad_clip_norm=float(os.environ.get('GRAD_CLIP_NORM',.3));eval_stride=int(os.environ.get('EVAL_STRIDE',64));muon_beta2=float(os.environ.get('MUON_BETA2',.95));adam_wd=float(os.environ.get('ADAM_WD',.02));muon_wd=float(os.environ.get('MUON_WD',.095));embed_wd=float(os.environ.get('EMBED_WD',.085));ema_decay=float(os.environ.get('EMA_DECAY',.9965));ttt_enabled=bool(int(os.environ.get('TTT_ENABLED','0')));ttt_lr=float(os.environ.get('TTT_LR',.005));ttt_epochs=int(os.environ.get('TTT_EPOCHS',3));ttt_momentum=float(os.environ.get('TTT_MOMENTUM',.9));ttt_chunk_tokens=int(os.environ.get('TTT_CHUNK_TOKENS',32768));etlb_enabled=bool(int(os.environ.get('ETLB_ENABLED','0')));etlb_lr=float(os.environ.get('ETLB_LR',.05));etlb_steps=int(os.environ.get('ETLB_STEPS',5));etlb_clip=float(os.environ.get('ETLB_CLIP',3.));compressor=os.environ.get('COMPRESSOR','brotli');gptq_calibration_batches=int(os.environ.get('GPTQ_CALIBRATION_BATCHES',64));gptq_reserve_seconds=float(os.environ.get('GPTQ_RESERVE_SECONDS',12.));matrix_bits=int(os.environ.get('MATRIX_BITS',6));embed_bits=int(os.environ.get('EMBED_BITS',8));matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',12.85));embed_clip_sigmas=float(os.environ.get('EMBED_CLIP_SIGMAS',2e1));distributed='RANK'in os.environ and'WORLD_SIZE'in os.environ;rank=int(os.environ.get('RANK','0'));world_size=int(os.environ.get('WORLD_SIZE','1'));local_rank=int(os.environ.get('LOCAL_RANK','0'));is_main_process=rank==0;grad_accum_steps=8//world_size;datasets_dir=os.path.join(data_dir,'datasets',f"fineweb10B_sp{vocab_size}");train_files=os.path.join(datasets_dir,'fineweb_train_*.bin');val_files=os.path.join(datasets_dir,'fineweb_val_*.bin');tokenizer_path=os.path.join(data_dir,'tokenizers',f"fineweb_{vocab_size}_bpe.model");logfile=f"logs/{run_id}.txt";model_path='final_model.pt';quantized_model_path='final_model.int6.ptz';tensorboard_dir = os.environ.get("TENSORBOARD_DIR", "./logs/tensorboard");use_mudd=bool(int(os.environ.get('USE_MUDD','0')));mudd_q_dilation=int(os.environ.get('MUDD_Q_DILATION','1'));mudd_k_dilation=int(os.environ.get('MUDD_K_DILATION','1'));mudd_prenorm=bool(int(os.environ.get('MUDD_PRENORM','0')));keep_unet=bool(int(os.environ.get('KEEP_UNET','1')));mudd_compress=bool(int(os.environ.get('MUDD_COMPRESS','0')));mudd_muon=bool(int(os.environ.get('MUDD_MUON','0')));mudd_emb=bool(int(os.environ.get('MUDD_EMB','0')));
+class Hyperparameters:data_dir=os.environ.get('DATA_DIR','./data/');seed=int(os.environ.get('SEED',1337));run_id=os.environ.get('RUN_ID',str(uuid.uuid4()));iterations=int(os.environ.get('ITERATIONS',20000));warmdown_frac=float(os.environ.get('WARMDOWN_FRAC',.72));warmup_steps=int(os.environ.get('WARMUP_STEPS',20));train_batch_tokens=int(os.environ.get('TRAIN_BATCH_TOKENS',786432));train_seq_len=int(os.environ.get('TRAIN_SEQ_LEN',2048));train_log_every=int(os.environ.get('TRAIN_LOG_EVERY',500));max_wallclock_seconds=float(os.environ.get('MAX_WALLCLOCK_SECONDS',6e2));val_batch_tokens=int(os.environ.get('VAL_BATCH_TOKENS',524288));eval_seq_len=int(os.environ.get('EVAL_SEQ_LEN',2048));val_loss_every=int(os.environ.get('VAL_LOSS_EVERY',4000));sliding_window_enabled=bool(int(os.environ.get('SLIDING_WINDOW_ENABLED','1')));vocab_size=int(os.environ.get('VOCAB_SIZE',8192));num_layers=int(os.environ.get('NUM_LAYERS',11));xsa_last_n=int(os.environ.get('XSA_LAST_N',11));model_dim=int(os.environ.get('MODEL_DIM',512));embedding_dim=int(os.environ.get('EMBEDDING_DIM',512));num_kv_heads=int(os.environ.get('NUM_KV_HEADS',4));num_heads=int(os.environ.get('NUM_HEADS',8));mlp_mult=float(os.environ.get('MLP_MULT',4.));skip_gates_enabled=bool(int(os.environ.get('SKIP_GATES_ENABLED','1')));tie_embeddings=bool(int(os.environ.get('TIE_EMBEDDINGS','1')));logit_softcap=float(os.environ.get('LOGIT_SOFTCAP',3e1));rope_base=float(os.environ.get('ROPE_BASE',1e4));rope_dims=int(os.environ.get('ROPE_DIMS',16));rope_train_seq_len=int(os.environ.get('ROPE_TRAIN_SEQ_LEN',2048));ln_scale=bool(int(os.environ.get('LN_SCALE','1')));qk_gain_init=float(os.environ.get('QK_GAIN_INIT',5.));num_loops=int(os.environ.get('NUM_LOOPS',2));loop_start=int(os.environ.get('LOOP_START',3));loop_end=int(os.environ.get('LOOP_END',5));enable_looping_at=float(os.environ.get('ENABLE_LOOPING_AT',.35));parallel_residual_start=int(os.environ.get('PARALLEL_RESIDUAL_START',7));min_lr=float(os.environ.get('MIN_LR',.0));embed_lr=float(os.environ.get('EMBED_LR',.6));head_lr=float(os.environ.get('HEAD_LR',.008));tied_embed_lr=float(os.environ.get('TIED_EMBED_LR',.03));tied_embed_init_std=float(os.environ.get('TIED_EMBED_INIT_STD',.005));matrix_lr=float(os.environ.get('MATRIX_LR',.022));scalar_lr=float(os.environ.get('SCALAR_LR',.02));muon_momentum=float(os.environ.get('MUON_MOMENTUM',.99));muon_backend_steps=int(os.environ.get('MUON_BACKEND_STEPS',5));muon_momentum_warmup_start=float(os.environ.get('MUON_MOMENTUM_WARMUP_START',.92));muon_momentum_warmup_steps=int(os.environ.get('MUON_MOMENTUM_WARMUP_STEPS',1500));muon_row_normalize=bool(int(os.environ.get('MUON_ROW_NORMALIZE','1')));beta1=float(os.environ.get('BETA1',.9));beta2=float(os.environ.get('BETA2',.95));adam_eps=float(os.environ.get('ADAM_EPS',1e-08));grad_clip_norm=float(os.environ.get('GRAD_CLIP_NORM',.3));eval_stride=int(os.environ.get('EVAL_STRIDE',64));muon_beta2=float(os.environ.get('MUON_BETA2',.95));adam_wd=float(os.environ.get('ADAM_WD',.02));muon_wd=float(os.environ.get('MUON_WD',.095));embed_wd=float(os.environ.get('EMBED_WD',.085));ema_decay=float(os.environ.get('EMA_DECAY',.9965));ttt_enabled=bool(int(os.environ.get('TTT_ENABLED','0')));ttt_lr=float(os.environ.get('TTT_LR',.005));ttt_epochs=int(os.environ.get('TTT_EPOCHS',3));ttt_momentum=float(os.environ.get('TTT_MOMENTUM',.9));ttt_chunk_tokens=int(os.environ.get('TTT_CHUNK_TOKENS',32768));etlb_enabled=bool(int(os.environ.get('ETLB_ENABLED','0')));etlb_lr=float(os.environ.get('ETLB_LR',.05));etlb_steps=int(os.environ.get('ETLB_STEPS',5));etlb_clip=float(os.environ.get('ETLB_CLIP',3.));compressor=os.environ.get('COMPRESSOR','brotli');gptq_calibration_batches=int(os.environ.get('GPTQ_CALIBRATION_BATCHES',64));gptq_reserve_seconds=float(os.environ.get('GPTQ_RESERVE_SECONDS',12.));matrix_bits=int(os.environ.get('MATRIX_BITS',6));embed_bits=int(os.environ.get('EMBED_BITS',8));matrix_clip_sigmas=float(os.environ.get('MATRIX_CLIP_SIGMAS',12.85));embed_clip_sigmas=float(os.environ.get('EMBED_CLIP_SIGMAS',2e1));distributed='RANK'in os.environ and'WORLD_SIZE'in os.environ;rank=int(os.environ.get('RANK','0'));world_size=int(os.environ.get('WORLD_SIZE','1'));local_rank=int(os.environ.get('LOCAL_RANK','0'));is_main_process=rank==0;grad_accum_steps=8//world_size;datasets_dir=os.path.join(data_dir,'datasets',f"fineweb10B_sp{vocab_size}");train_files=os.path.join(datasets_dir,'fineweb_train_*.bin');val_files=os.path.join(datasets_dir,'fineweb_val_*.bin');tokenizer_path=os.path.join(data_dir,'tokenizers',f"fineweb_{vocab_size}_bpe.model");logfile=f"logs/{run_id}.txt";model_path='final_model.pt';quantized_model_path='final_model.int6.ptz';tensorboard_dir = os.environ.get("TENSORBOARD_DIR", "./logs/tensorboard");use_mudd=bool(int(os.environ.get('USE_MUDD','0')));mudd_q_dilation=int(os.environ.get('MUDD_Q_DILATION','1'));mudd_k_dilation=int(os.environ.get('MUDD_K_DILATION','1'));keep_unet=bool(int(os.environ.get('KEEP_UNET','1')));mudd_emb=bool(int(os.environ.get('MUDD_EMB','0')));
 _logger_hparams=None
 def set_logging_hparams(h):global _logger_hparams;_logger_hparams=h
 def log(msg,console=True):
@@ -96,7 +95,7 @@ def apply_rotary_emb(x,cos,sin,rope_dims=0):
 	if rope_dims>0 and rope_dims<x.size(-1):x_rope,x_pass=x[...,:rope_dims],x[...,rope_dims:];half=rope_dims//2;x1,x2=x_rope[...,:half],x_rope[...,half:];x_rope=torch.cat((x1*cos+x2*sin,x1*-sin+x2*cos),dim=-1);return torch.cat((x_rope,x_pass),dim=-1)
 	half=x.size(-1)//2;x1,x2=x[...,:half],x[...,half:];return torch.cat((x1*cos+x2*sin,x1*-sin+x2*cos),dim=-1)
 class MultiwayDynamicDenseBlock(nn.Module):
-	def __init__(self, dim, lidx, last_layer=False, multiway=False, q_dilation=1, k_dilation=1, base_layer=1, mudd_in_channels=None, num_ways=4, local_window_size=None):
+	def __init__(self, dim, lidx, last_layer=False, multiway=False, k_dilation=1, base_layer=1, num_ways=4, local_window_size=None):
 		super().__init__()
 		self.norm = RMSNorm()
 		if multiway:self.C = num_ways if not last_layer else 1
@@ -104,32 +103,28 @@ class MultiwayDynamicDenseBlock(nn.Module):
 		self.lidx = lidx
 		if local_window_size is None:l = base_layer + (lidx + 1) // k_dilation
 		else:l = local_window_size
-		self.local_window_size = local_window_size;hid_dim, out_dim = l * self.C, l * self.C;self.dim = dim;self.mudd_in_channels = mudd_in_channels or dim
-		self.w1 = CastedLinear(self.mudd_in_channels, hid_dim, bias=False);self.act = nn.GELU();self.w2 = CastedLinear(hid_dim, out_dim, bias=True);self.w2._zero_init = True
+		self.local_window_size = local_window_size;hid_dim, out_dim = l * self.C, l * self.C;self.dim = dim
+		self.w1 = CastedLinear(dim, hid_dim, bias=False);self.act = nn.GELU();self.w2 = CastedLinear(hid_dim, out_dim, bias=True);self.w2._zero_init = True
 		self.w2.bias.data.fill_(0.0)
-		# backout = False
-		# if lidx == 16 and backout:
-		# 	self.w2.bias.data[-5].fill_(-0.5)
-		self.mudd_scale = 0.01 #
+		self.mudd_scale = 0.01 
 		self.scale = nn.Parameter(torch.ones(dim * self.C, dtype=torch.float32)*self.mudd_scale)
 	def forward(self, x):
-		x = self.norm(x[:,:,:self.mudd_in_channels])
+		x = self.norm(x)
 		dw = self.w2(self.act(self.w1(x)))
 		dw = rearrange(dw, 'B T (C L) -> C B T L', C=self.C)
 		return dw
 	def layer_mix(self, x, all_hids, dw, hidden_masks=None):
 		L = dw.shape[3]
-		if L == 1:
+		if L == 1: # aggregate only embedding
 			hids = all_hids[:1]
-		elif L > 2:
+		elif L > 2: 
 			hids = all_hids[:1] + all_hids[-(L-2):] + all_hids[-1:]
-		else:
+		else: # aggregate embedding and current layer
 			hids = all_hids[:1] + all_hids[-1:]
 		scale = self.scale.to(dtype=hids[0].dtype).view(self.C, 1, 1, -1)
 		weighted = dw[:, :, :, 0, None] * hids[0]
 		for j in range(1, L):weighted = weighted + dw[:, :, :, j, None] * hids[j]
-		normed = F.rms_norm(weighted, (weighted.size(-1),)) * scale
-		result = normed	
+		result = F.rms_norm(weighted, (weighted.size(-1),)) * scale
 		return tuple(result[c] for c in range(self.C)) if self.C > 1 else result[0]
 class CausalSelfAttention(nn.Module):
 	def __init__(self,dim,num_heads,num_kv_heads,rope_base,qk_gain_init,train_seq_len):
@@ -140,30 +135,22 @@ class CausalSelfAttention(nn.Module):
 		if self.head_dim%2!=0:raise ValueError('head_dim must be even for RoPE')
 		kv_dim=self.num_kv_heads*self.head_dim;self.c_q=CastedLinear(dim,dim,bias=False);self.c_k=CastedLinear(dim,kv_dim,bias=False);self.c_v=CastedLinear(dim,kv_dim,bias=False);self.proj=CastedLinear(dim,dim,bias=False);self.proj._zero_init=True;self.q_gain=nn.Parameter(torch.full((num_heads,),qk_gain_init,dtype=torch.float32));self.rope_dims=0;self.rotary=Rotary(self.head_dim,base=rope_base,train_seq_len=train_seq_len);self.use_xsa=False
 	def _xsa_efficient(self,y,v):B,T,H,D=y.shape;Hkv=v.size(-2);group=H//Hkv;y_g=y.reshape(B,T,Hkv,group,D);vn=F.normalize(v,dim=-1).unsqueeze(-2);proj=(y_g*vn).sum(dim=-1,keepdim=True)*vn;return(y_g-proj).reshape(B,T,H,D)
-	def forward(self,x, vway=None):
-		# if isinstance(x, tuple):
-		# 	if len(x) == 3:
-		# 		xq, xk, xv = x
-		# 	elif len(x) == 2: # qk share one way
-		# 		xq, xv = x
-		# 		xk = xq
-		# 	bsz, seqlen, dim = xq.shape
-		# else:
+	def forward(self,x, qkvway=None):
 		bsz, seqlen, dim = x.shape
 		xq, xk, xv = x, x, x
-		if vway is not None:
-			if isinstance(vway, tuple) and len(vway) == 3:
-				q=self.c_q(xq+vway[0]).reshape(bsz,seqlen,self.num_heads,self.head_dim)
-				k=self.c_k(xk+vway[1]).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
-				v= self.c_v(xv + vway[2]).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
-			elif isinstance(vway, tuple) and len(vway) == 2:
-				q=self.c_q(xq+vway[0]).reshape(bsz,seqlen,self.num_heads,self.head_dim)
-				k=self.c_k(xk+vway[0]).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
-				v= self.c_v(xv + vway[1]).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
-			elif isinstance(vway, tuple) and len(vway) == 1:
+		if qkvway is not None:
+			if isinstance(qkvway, tuple) and len(qkvway) == 3:
+				q=self.c_q(xq+qkvway[0]).reshape(bsz,seqlen,self.num_heads,self.head_dim)
+				k=self.c_k(xk+qkvway[1]).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
+				v= self.c_v(xv + qkvway[2]).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
+			elif isinstance(qkvway, tuple) and len(qkvway) == 2:
+				q=self.c_q(xq+qkvway[0]).reshape(bsz,seqlen,self.num_heads,self.head_dim)
+				k=self.c_k(xk+qkvway[0]).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
+				v= self.c_v(xv + qkvway[1]).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
+			elif isinstance(qkvway, tuple) and len(qkvway) == 1:
 				q=self.c_q(xq).reshape(bsz,seqlen,self.num_heads,self.head_dim)
 				k=self.c_k(xk).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
-				v= self.c_v(xv + vway[0]).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
+				v= self.c_v(xv + qkvway[0]).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
 		else:
 			q=self.c_q(xq).reshape(bsz,seqlen,self.num_heads,self.head_dim)
 			k=self.c_k(xk).reshape(bsz,seqlen,self.num_kv_heads,self.head_dim)
@@ -177,8 +164,8 @@ class MLP(nn.Module):
 	def __init__(self,dim,mlp_mult, lidx=None, use_mudd=False):
 		super().__init__()
 		hidden= int(mlp_mult*dim)
-		if lidx == 2: # reduce hidden dim to match the limit of 16M
-			hidden -= 48
+		if lidx == 2: # reduce mlp hidden dim to keep the total params under the limit of 16M
+			hidden -= 64
 		self.fc=CastedLinear(dim,hidden,bias=False);self.proj=CastedLinear(hidden,dim,bias=False);self.proj._zero_init=True
 	def forward(self,x):return self.proj(F.leaky_relu(self.fc(x),negative_slope=.5).square())
 class Block(nn.Module):
@@ -188,40 +175,26 @@ class Block(nn.Module):
 		self.attn_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32))
 		self.mlp=MLP(dim,mlp_mult, lidx=layer_idx, use_mudd=use_mudd)
 		self.mlp_scale=nn.Parameter(torch.ones(dim,dtype=torch.float32));self.resid_mix=nn.Parameter(torch.stack((torch.ones(dim),torch.zeros(dim))).float()) if keep_unet else None; self.keep_unet=keep_unet
-
 		self.ln_scale_factor=1./math.sqrt(layer_idx+1)if ln_scale else 1.;self.parallel=False;self.use_mudd=use_mudd
 	def forward(self,x, x0, vm=None, is_recurrent=False, looping_active=False):
-		vway = None
 		if is_recurrent and not looping_active:
 			return x[-1] if isinstance(x, tuple) else x
-		if False and self.use_mudd and not self.keep_unet:
-			x = vm
-			if isinstance(x, tuple):
-				x_in = [-1]
-				normed_x = tuple([self.attn_norm(x_i) * self.ln_scale_factor for x_i in x[:-1]])
+		if self.resid_mix is None:
+			x_in = x
+		else:
+			mix=self.resid_mix.to(dtype=x.dtype)
+			x_in=mix[0][None,None,:]*x+mix[1][None,None,:]*x0
+		qkvway = None
+		if vm is not None:
+			if isinstance(vm, tuple): # 2/3-way
+				qkvway = vm[:-1];normed_x = self.attn_norm(x_in)*self.ln_scale_factor
+				x_in = x_in + vm[-1]
 			else: # 1-way
-				x_in = x
-				normed_x = self.attn_norm(x_in) * self.ln_scale_factor
-		else:
-			if self.resid_mix is None:
-				x_in = x
-			else:
-				mix=self.resid_mix.to(dtype=x.dtype)
-				x_in=mix[0][None,None,:]*x+mix[1][None,None,:]*x0
-			if vm is not None:
-				if isinstance(vm, tuple): # 2/3-way
-					vway = vm[:-1];normed_x = self.attn_norm(x_in)*self.ln_scale_factor
-					# normed_x = self.attn_norm(x_in+vm[0])*self.ln_scale_factor
-					x_in = x_in + vm[-1]
-				else: # 1-way
-					x_in = x_in + vm
-					normed_x = self.attn_norm(x_in)*self.ln_scale_factor
-			else:
+				x_in = x_in + vm
 				normed_x = self.attn_norm(x_in)*self.ln_scale_factor
-		if self.attn is not None:
-			attn_out=self.attn(normed_x, vway=vway) * self.attn_scale.to(dtype=x_in.dtype)[None,None,:]
 		else:
-			attn_out = 0
+			normed_x = self.attn_norm(x_in)*self.ln_scale_factor
+		attn_out=self.attn(normed_x, qkvway=qkvway) * self.attn_scale.to(dtype=x_in.dtype)[None,None,:]
 		if self.parallel:
 			mlp_out=self.mlp(self.mlp_norm(x_in)*self.ln_scale_factor)
 			x_out=x_in+attn_out+self.mlp_scale.to(dtype=x_in.dtype)[None,None,:]*mlp_out
@@ -266,93 +239,24 @@ class GPT(nn.Module):
 					else:
 						is_recur_indices.append(j in all_indices[:i-1])
 				self.is_recur_indices = is_recur_indices
-				# print('is_recur_indices', is_recur_indices)
-				# print('all_indices', all_indices)
-				# print('encoder_indices', self.encoder_indices)
-				# print('decoder_indices', self.decoder_indices)
 		else:self.encoder_indices=list(range(self.num_encoder_layers));self.decoder_indices=list(range(self.num_encoder_layers,h.num_layers))
 		self.num_skip_weights=min(len(self.encoder_indices),len(self.decoder_indices))
 		use_mudd = h.use_mudd
 		self.skip_weights=nn.Parameter(torch.ones(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if h.keep_unet else None
 		self.skip_gates=nn.Parameter(torch.zeros(self.num_skip_weights,h.model_dim,dtype=torch.float32)) if h.skip_gates_enabled and h.keep_unet else None
 		if h.use_mudd:
-			self.num_mudd_embs = 1
-			self.mudd_emb = nn.Embedding(h.vocab_size,h.embedding_dim * self.num_mudd_embs) if h.mudd_emb else None
-			self.mudd_compress = h.mudd_compress
 			looped_num_layers = len(all_indices)
-			self.mudd_skip_indices = []
-			self.mudd_q_dilation=h.mudd_q_dilation;self.mudd_k_dilation=h.mudd_k_dilation;self.mudd_in_channels=h.model_dim
+			self.mudd_q_dilation=h.mudd_q_dilation
+			self.mudd_k_dilation=h.mudd_k_dilation
 			num_base_layers=1 if self.mudd_emb is None else 2
-			mode = 'mudd_base8'
-			if mode == 'mudd_base':
-				self.num_ways = [1]*12 + [2] * looped_num_layers
-				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
-				local_window_sizes= [2, None, None,None]*looped_num_layers
-			elif mode == 'mudd_base2':
-				self.num_ways = [1]*12 + [2] * looped_num_layers
-				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
-				local_window_sizes= [None, None, 2,None]*looped_num_layers
-			elif mode == 'mudd_base3':
-				self.num_ways = [1]*8 + [2] * looped_num_layers
-				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
-				local_window_sizes= [None, None, 2,None]*looped_num_layers
-			elif mode == 'mudd_base5':
-				self.num_ways = [1]*12 + [2] * looped_num_layers
-				self.mudd_q_indices = [2,4,6,8,10,13,15,16]#list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
-				local_window_sizes= [None, None, 2,None]*looped_num_layers
-			elif mode == 'mudd_base6':
-				self.num_ways = [1]*12 + [2] * looped_num_layers
-				self.mudd_q_indices = [2,4,6,8,10,12,15,16]
-				local_window_sizes= [None, None, 2,None]*looped_num_layers
-			elif mode == 'mudd_base7':
-				self.num_ways = [1]*12 + [3] * looped_num_layers
-				self.mudd_q_indices = [2,4,6,8,10,12,15,16]
-				local_window_sizes= [None, None, 2,None]*looped_num_layers
-			elif mode == 'mudd_base8':
-				self.num_ways = [1]*12 + [2] + [3] * looped_num_layers
-				self.mudd_q_indices = [2,4,6,8,10,12,15,16]
-				local_window_sizes= [None, None, 2,None]*looped_num_layers
-			elif mode == 'mudd_base_lite2':
-				self.num_ways = [1]*15 + [2] * looped_num_layers
-				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
-				local_window_sizes= [2]*8 + [None, None, 2,None]*looped_num_layers
-			elif mode == 'mudd_base_lite3':
-				self.num_ways = [1]*12 + [2] * looped_num_layers
-				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
-				local_window_sizes= [2]*10 + [None, None, 2,None]*looped_num_layers
-			elif mode == 'mudd_base_lite4': 
-				self.num_ways = [1]*15 + [2] * looped_num_layers
-				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
-				local_window_sizes= [2, None, None,None]*looped_num_layers
-			elif mode == 'mudd_base_lite5':
-				self.num_ways = [1]*8 + [2] * looped_num_layers
-				self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
-				local_window_sizes= [2, None, None,None]*looped_num_layers
-			elif mode == 'mudd_base_lite6':
-				self.num_ways = [1]*12 + [2] * looped_num_layers
-				self.mudd_q_indices = [0, 1, 2, 14, 15, 16]
-				# self.mudd_q_indices = list(range(0, looped_num_layers, self.mudd_q_dilation))[1:] + [15,16]
-				local_window_sizes= [2, None, None,None]*3 + [2, 2, 2, None,None]
-			elif mode == 'mudd_vway_only':
-				self.num_ways = [1]* looped_num_layers
-				self.mudd_q_indices = [15,16]
-				local_window_sizes = [None]*looped_num_layers
-			elif mode == 'mudd_vway_only15':
-				self.num_ways = [1]* looped_num_layers
-				self.mudd_q_indices = [15]
-				local_window_sizes = [None]*looped_num_layers
-			elif mode == 'mudd_vway_only16':
-				self.num_ways = [1]* looped_num_layers
-				self.mudd_q_indices = [16]
-				local_window_sizes = [None]*looped_num_layers
-			elif mode == 'mudd_q_all':
-				self.mudd_q_indices = list(range(looped_num_layers))
-				local_window_sizes = [1] * 8 + [2, 1, None,1] + [2, 1, None,None] + [None, None] #*looped_num_layers # first 8 layers and even layers mix x0 only; 
-				self.num_ways = [1]*12 + [2, 1] * looped_num_layers
-			self.dynamic_dense=nn.ModuleList([MultiwayDynamicDenseBlock(h.model_dim,i,last_layer=i==looped_num_layers-1,multiway=True,q_dilation=self.mudd_q_dilation,k_dilation=self.mudd_k_dilation,base_layer=num_base_layers,mudd_in_channels=self.mudd_in_channels,num_ways=self.num_ways[i],local_window_size=local_window_sizes[i]) if i in self.mudd_q_indices else None for i in range(looped_num_layers)])
+			self.num_ways = [1]*12 + [2] * 5
+			self.mudd_q_indices = [2,4,6,8,10,12,15,16]
+			local_window_sizes= [None, None, 2,None]*5
+			self.dynamic_dense=nn.ModuleList([MultiwayDynamicDenseBlock(h.model_dim,i,last_layer=i==looped_num_layers-1,multiway=True,k_dilation=self.mudd_k_dilation,base_layer=num_base_layers,num_ways=self.num_ways[i],local_window_size=local_window_sizes[i]) if i in self.mudd_q_indices else None for i in range(looped_num_layers)])
+		    if h.mudd_emb:
+				self.num_mudd_embs = 1
+				self.mudd_emb = nn.Embedding(h.vocab_size,h.embedding_dim * self.num_mudd_embs) 
 		else:self.dynamic_dense=nn.ModuleList()
-		if h.mudd_prenorm:self.mudd_prenorm=RMSNorm()
-		else:self.mudd_prenorm=lambda x:x
 		self._init_weights()
 	def _init_weights(self):
 		if self.tie_embeddings:nn.init.normal_(self.tok_emb.weight,mean=.0,std=self.tied_embed_init_std)
@@ -373,19 +277,13 @@ class GPT(nn.Module):
 		if self.use_mudd:hiddens.append(x)
 		mudd_idx=0;looped_num_layers=len(enc_iter)+len(dec_iter) if self.use_mudd else 0
 		vm = None # value and mlp way
-		# if self.looping_active:
-		# 	mudd_masks = [True]*looped_num_layers
-		# else:
-		# 	mudd_masks = [ False if self.is_recur_indices[idx] else True for idx in range(looped_num_layers)]
-		mudd_masks = [True]*looped_num_layers
 		for _idx, i in enumerate(enc_iter):
 			x=self.blocks[i](x,x0, vm=vm, is_recurrent=self.is_recur_indices[_idx], looping_active=self.looping_active)
 			if self.skip_weights is not None:
 				skips.append(x)
 			if self.use_mudd:
 				if mudd_idx%self.mudd_k_dilation==0:hiddens.append(x)
-				# if mudd_idx%self.mudd_q_dilation==0 and mudd_idx not in self.mudd_skip_indices:
-				if mudd_idx in self.mudd_q_indices and mudd_masks[mudd_idx]:
+				if mudd_idx in self.mudd_q_indices:
 					dw=self.dynamic_dense[mudd_idx](x);mixed=self.dynamic_dense[mudd_idx].layer_mix(x,hiddens,dw)
 					vm=mixed
 				else:
@@ -400,7 +298,7 @@ class GPT(nn.Module):
 			if self.use_mudd:
 				if mudd_idx%self.mudd_k_dilation==0:
 					hiddens.append(x)
-				if mudd_idx in self.mudd_q_indices and mudd_masks[mudd_idx]:
+				if mudd_idx in self.mudd_q_indices:
 					dw=self.dynamic_dense[mudd_idx](x);mixed=self.dynamic_dense[mudd_idx].layer_mix(x,hiddens,dw)
 					vm=mixed
 				else:
@@ -463,11 +361,7 @@ class Optimizers:
 		if base_model.use_mudd:
 			for block in base_model.dynamic_dense:
 				if block is not None:mudd_scalar_params.extend([p for p in block.parameters() if p.ndim<2]);mudd_matrix_params.extend([p for p in block.parameters() if p.ndim==2])
-		if h.mudd_muon:
-			matrix_params.extend(mudd_matrix_params)
-			scalar_params.extend(mudd_scalar_params)
-		else:
-			scalar_params.extend(mudd_scalar_params+mudd_matrix_params)
+		scalar_params.extend(mudd_scalar_params+mudd_matrix_params)
 		token_lr=h.tied_embed_lr if h.tie_embeddings else h.embed_lr;tok_params=[{'params':[base_model.tok_emb.weight]+([base_model.mudd_emb.weight] if base_model.mudd_emb is not None else []),'lr':token_lr,'base_lr':token_lr}];self.optimizer_tok=torch.optim.AdamW(tok_params,betas=(h.beta1,h.beta2),eps=h.adam_eps,weight_decay=h.embed_wd,fused=True);self.optimizer_muon=Muon(matrix_params,lr=h.matrix_lr,momentum=h.muon_momentum,backend_steps=h.muon_backend_steps,weight_decay=h.muon_wd,row_normalize=h.muon_row_normalize)
 		for group in self.optimizer_muon.param_groups:group['base_lr']=h.matrix_lr
 		self.optimizer_scalar=torch.optim.AdamW([{'params':scalar_params,'lr':h.scalar_lr,'base_lr':h.scalar_lr}],betas=(h.beta1,h.beta2),eps=h.adam_eps,weight_decay=h.adam_wd,fused=True);self.optimizers=[self.optimizer_tok,self.optimizer_muon,self.optimizer_scalar]
@@ -494,8 +388,6 @@ def collect_hessians(model,train_loader,h,device,n_calibration_batches=64):
 			hessians[name].addmm_(x.T,x)
 		return hook_fn
 	for(name,module)in model.named_modules():
-		# if isinstance(module,CastedLinear)and module.weight.numel()>65536:
-		# Line 686 — hessian collection
 		if isinstance(module, CastedLinear) and (
 			module.weight.numel() > 65536//16 or
 			(hasattr(module, '_parent_name') and 'mudd' in module._parent_name and '.w1' in module._parent_name)
@@ -653,7 +545,6 @@ def timed_eval(label,fn,*args,**kwargs):torch.cuda.synchronize();t0=time.perf_co
 def train_model(h,device,val_data):
 	base_model=GPT(h).to(device).bfloat16();restore_fp32_params(base_model)
 	compiled_model=torch.compile(base_model,dynamic=False,fullgraph=True)
-	# compiled_model = base_model
 	if h.distributed:model=DDP(compiled_model,device_ids=[h.local_rank],broadcast_buffers=False,find_unused_parameters=False)
 	else:model=compiled_model
 	if h.is_main_process:
@@ -685,16 +576,6 @@ def train_model(h,device,val_data):
 			with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):loss=model(x,y)
 			train_loss+=loss.detach();(loss/h.grad_accum_steps).backward()
 		train_loss/=h.grad_accum_steps;frac=min(step/h.muon_momentum_warmup_steps,1.)if h.muon_momentum_warmup_steps>0 else 1.;muon_momentum=(1-frac)*h.muon_momentum_warmup_start+frac*h.muon_momentum
-        # find unused parameters
-		# if h.is_main_process and step == 0:
-		# 	unused = [
-		# 		name for name, p in base_model.named_parameters()
-		# 		if p.requires_grad and p.grad is None
-		# 	]
-		# 	if unused:
-		# 		print("unused params (requires_grad, grad is None after step backward):")
-		# 		for name in unused:
-		# 			print(" ", name)
 		for group in optimizers.optimizer_muon.param_groups:group['momentum']=muon_momentum
 		for opt in optimizers:
 			for group in opt.param_groups:group['lr']=group['base_lr']*lr_scale
