@@ -134,3 +134,40 @@ torchrun --standalone --nproc_per_node=2 train_gpt0409.py
 # mudd_multiway_q2k1_scale0p1_kvshift
 
 # mudd_multiway_q2k1_ch2_reproduce
+
+# full train 
+
+NCCL_NET=Socket NCCL_DEBUG=WARN SEED=42 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
+RUN_ID=baseline0409_mudd_q2k2_LnLGGG_wayhalf_recur_full_train_lite \
+USE_KV_SHIFT=0 USE_DCMHA=0 USE_MUDD=1 MUDD_Q_DILATION=2 MUDD_K_DILATION=2 \
+torchrun --standalone --nproc_per_node=8 train_gpt0409.py
+
+
+NCCL_NET=Socket NCCL_DEBUG=WARN SEED=423 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
+RUN_ID=baseline0409_mudd_qdil2kdil2_2way_vway_base8_vbeforeproj_matched_params_seed423 TENSORBOARD_DIR='' WARMUP_STEPS=150 \
+USE_KV_SHIFT=0 USE_DCMHA=0 USE_MUDD=1 MUDD_Q_DILATION=2 MUDD_K_DILATION=1 \
+TRAIN_BATCH_TOKENS=786432 MAX_WALLCLOCK_SECONDS=600 \
+KEEP_UNET=0 NUM_LAYERS=11 MUDD_EMB=0 MLP_MULT=4 \
+torchrun --standalone --nproc_per_node=8 train_gpt0409.py
+
+
+
+NCCL_NET=Socket NCCL_DEBUG=WARN SEED=42 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
+RUN_ID=baseline0409_660s MAX_WALLCLOCK_SECONDS=660 \
+torchrun --standalone --nproc_per_node=8 train_gpt0409_base.py
+
+NCCL_NET=Socket NCCL_DEBUG=WARN SEED=42 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
+RUN_ID=baseline0409_720s MAX_WALLCLOCK_SECONDS=720 \
+torchrun --standalone --nproc_per_node=8 train_gpt0409_base.py
+
+NCCL_NET=Socket NCCL_DEBUG=WARN SEED=42 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
+RUN_ID=baseline0409_540s MAX_WALLCLOCK_SECONDS=540 \
+torchrun --standalone --nproc_per_node=8 train_gpt0409_base.py
+
+NCCL_NET=Socket NCCL_DEBUG=WARN SEED=42 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
+RUN_ID=baseline0409_480s MAX_WALLCLOCK_SECONDS=480 \
+torchrun --standalone --nproc_per_node=8 train_gpt0409_base.py
+
+NCCL_NET=Socket NCCL_DEBUG=WARN SEED=42 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
+RUN_ID=baseline0409_420s MAX_WALLCLOCK_SECONDS=420 \
+torchrun --standalone --nproc_per_node=8 train_gpt0409_base.py
