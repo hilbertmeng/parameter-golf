@@ -1,38 +1,30 @@
-# Record: SP8192 + 3-Layer Recurrence + Parallel Residuals + QK-Gain 5.25 + Legal TTT
+# Record: MUDD Connections + SP8192 + 3-Layer Recurrence + Parallel Residuals + QK-Gain 5.25 + Legal TTT
 
-**val_bpb = 1.0810** (3-seed mean, std 0.0002) | **~15.99 MB** | 8xH100 SXM
+**val_bpb = 1.0769** (3-seed mean, std 0.0004) | **~15.99 MB** | 8xH100 HBM3
 
 ## 3-Seed Results
 
 | Seed | Sliding BPP | **TTT BPP** | Artifact |
 |------|-------------|-------------|----------|
-| 42   | 1.0829      | **1.0808**  | 15,991,930 |
-| 314  | 1.0827      | **1.0810**  | 15,992,919 |
-| 999  | 1.0826      | **1.0812**  | 15,993,232 |
-| **Mean** | **1.0827** | **1.0810** | **15,992,694** |
-| **Std** | **0.0002** | **0.0002** | |
+| 42   | 1.0788      | **1.0774**  | 15996370 |
+| 423  | 1.0787      | **1.0767**  | 15998081 |
+| 424  | 1.0777      | **1.0765**  | 15996509 |
+| **Mean** | **1.0784** | **1.0769** | **15996987** |
+| **Std** | **0.0005** | **0.0004** | |
 
-Merged SOTA (PR #1019): **1.1147 BPP**. Delta: **-0.0337 BPP**. Clears the 0.005-nat threshold.
+Based on SOTA (PR #1493): **1.0810 BPP**. Delta: **-0.0041 BPP ~= 0.0107 nats**. Meets the 0.005-nat threshold.
 
 ## Key Techniques
 
 ### My Contribution
 
 **MUDD Connections**
-I introduce a lite verion of MUDD Connections(MUDDFormer), and remove sigmoid-gated U-Net connections and residual mixing with x0, because MUDD Connections is more comprehensive. To reduce the overhead of MUDD Conns, I reduce connections from the following three aspects:
-- **Query side** constrain layers to make aggregations to [2,4,6,8,10,12,15,16]
-- **Key side** use local/gobal windows: [2, None, 2, None, 2, None, None, None]
-- **Num_ways** only use 2 ways (V and R): [1, 1, 1, 1, 1, 2, 2, 1]
+I introduce a lite version of **MU**ltiway **D**ynamic **D**ense (MUDD) Connections ([**MUDDFormer**](https://arxiv.org/abs/2502.12170)), and remove sigmoid-gated U-Net connections and residual mixing with x0, both of which can be seen as special cases of MUDD Connections. Although MUDD Connections is more comprehensive, the full version brings more overhead than performance gain. To reduce the overhead of MUDD Connections, I restrict connections from the following three aspects:
+- **Query side** roughly a 2-stride query dilation; layer indices to make layer-aggregation: [2,4,6,8,10,12,15,16]
+- **Key side** adopt interleaved local/global windows along layer-dimension and use more global windows for upper layers; corresponding window sizes: [2, None, 2, None, 2, None, None, None] (None represents global window)
+- **Num of ways** keep V-stream and R-stream (the two more important streams in Q/K/V/R) for layer 12, 15, and retain only R-stream for other layers; corresponding number of ways: [1, 1, 1, 1, 1, 2, 2, 1]
 
-When you 
-mudd lidx 2 num_ways 1 local_window_size 2 scale 0.01 k_components 2
-mudd lidx 4 num_ways 1 local_window_size None scale 0.01 k_components 6
-mudd lidx 6 num_ways 1 local_window_size 2 scale 0.01 k_components 2
-mudd lidx 8 num_ways 1 local_window_size None scale 0.01 k_components 10
-mudd lidx 10 num_ways 1 local_window_size 2 scale 0.01 k_components 2
-mudd lidx 12 num_ways 2 local_window_size None scale 0.01 k_components 14
-mudd lidx 15 num_ways 2 local_window_size None scale 0.01 k_components 17
-mudd lidx 16 num_ways 1 local_window_size None scale 0.01 k_components 18
+In addition, MUDD Connections prefers wide V-stream, so I switch GQA back to MHA. 
 
 ### Previous Credits
 1. **SP8192 + GPTQ SDClip** — int6 matrices (k=12.85), int8 embeddings (k=20.0), zero selective pruning (PR #1394 @clarkkev)
@@ -41,20 +33,20 @@ mudd lidx 16 num_ways 1 local_window_size None scale 0.01 k_components 18
 4. **QK-Gain 5.25** — learnable per-head query scaling, monotonic improvement from 4.0 to 5.25
 5. **Legal Score-First TTT** — SGD (lr=0.005, momentum=0.9), 3 epochs per 32K-token chunk, cosine LR decay. Score-before-update ordering. (PR #549 @abaybektursun, PR #1413 @dexhunter)
 6. **Tuned Hyperparameters** — WD=0.095, MLR=0.022, EMA=0.9965, warmdown=0.72 (PR #1445 @X-Abhishek-X)
-7. **LZMA code wrapper** — ~16.6KB code, saves ~43KB vs uncompressed
+7. **LZMA code wrapper** — save bytes for code
 
 ## Architecture
 
-11L x 512d x 8H / 4KV, MLP 4x, LeakyReLU(0.5)^2, Partial RoPE (16/64 dims), layerwise LN scale, tied embeddings, logit softcap=30.0. Depth recurrence: encoder [0,1,2,3,4,5,3,4] decoder [5,3,4,5,6,7,8,9,10] (loops layers 3-5, activated at step ~2016). Parallel residuals from layer 7: attention and MLP operate on same pre-residual input. Replace sigmoid-gated U-Net connections and residual mixing with x0 by **MUDD Connections** .
+11L x 512d x 8H / 8KV, MLP 3.5x, LeakyReLU(0.5)^2, Partial RoPE (16/64 dims), layerwise LN scale, tied embeddings, logit softcap=30.0. Depth recurrence: encoder [0,1,2,3,4,5,3,4] decoder [5,3,4,5,6,7,8,9,10] (loops layers 3-5, activated at step ~2016). Parallel residuals from layer 7: attention and MLP operate on same pre-residual input. Replace sigmoid-gated U-Net connections and residual mixing with x0 by **MUDD Connections**.
 
 
 ## Training
 
-MuonEq-R optimizer (row-normalized Muon, Newton-Schulz 5 steps), AdamW for embeddings/scalars. 4550 steps in 588s on 8xH100 HBM3. Linear warmdown to LR=0 over final 72% of training. EMA decay 0.9965.
+MuonEq-R optimizer (row-normalized Muon, Newton-Schulz 5 steps), AdamW for embeddings/scalars. 4367 steps in 588s on 8xH100 HBM3. Linear warmdown to LR=0 over final 72% of training. EMA decay 0.9965.
 
 ## Quantization
 
-Full-Hessian GPTQ with SDClip: `clip = k * std(row)` for principled rate-distortion. int6 for attention/MLP matrices, int8 for token embeddings. Byte-shuffle + Brotli-11 compression. Zero selective pruning needed -- model fits natively under 16MB.
+Full-Hessian GPTQ with SDClip: `clip = k * std(row)` for principled rate-distortion. int6 for attention/MLP matrices and part of dynamic dense matrices, int8 for token embeddings. Byte-shuffle + Brotli-11 compression. Zero selective pruning needed -- model fits natively under 16MB.
 
 ## TTT (Test-Time Training)
 
@@ -63,7 +55,7 @@ Score-first, chunk-based SGD adaptation at eval time:
 - For each chunk: (1) score all sliding windows under `torch.no_grad()`, (2) train model on scored chunk tokens with SGD
 - 3 epochs per chunk, cosine LR decay across chunks
 - Gradient clipping at 1.0, distributed all-reduce for multi-GPU
-- Total TTT eval time: ~370s (within 600s eval budget)
+- Total TTT eval time: ~371s (within 600s eval budget)
 
 ## Compliance
 
@@ -90,12 +82,14 @@ pip install brotli sentencepiece
 pip install flash_attn_3 --no-deps --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/
 MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf python3 data/cached_challenge_fineweb.py --variant sp8192
 
-SEED=42 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
-  torchrun --standalone --nproc_per_node=8 train_gpt.py
+NCCL_NET=Socket NCCL_DEBUG=WARN SEED=423 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
+RUN_ID=baseline0409_mudd_seed42 USE_MUDD=1 KEEP_UNET=0 MLP_MULT=3.5 NUM_KV_HEADS=80 WARMUP_STEPS=150 TENSORBOARD_DIR=''  \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
 
 ## Credits
 
+- **@bigbigbag** - SOTA Baseline 04-09 
 - **@clarkkev** — SP8192 + GPTQ Embeddings + SDClip + MuonEq-R + depth recurrence (PR #1394)
 - **@dexhunter** — 3-layer depth recurrence (PR #1331, #1437), legal TTT on SP8192 (PR #1413)
 - **@abaybektursun** — Score-first TTT framework (PR #549, merged precedent)
@@ -105,7 +99,7 @@ SEED=42 QK_GAIN_INIT=5.25 TTT_ENABLED=1 TTT_LR=0.005 TTT_EPOCHS=3 \
 
 ## Acknowledgements
 
-Thanks to OpenAI's Advanced Competitor grant ($500 compute credit via RunPod) -- this was instrumental in running the 160+ experiments across Steps 1-22 that led to this result.
+Thanks to ColorfulClouds Tech for providing compute. Thanks to @Lisennlp and @xiaoda99 for valuable discussions on reducing the overhead of MUDD Connections.
 
 ## Included Files
 
@@ -113,5 +107,5 @@ Thanks to OpenAI's Advanced Competitor grant ($500 compute credit via RunPod) --
 - `submission.json`
 - `train_gpt.py`
 - `train_seed42.log`
-- `train_seed314.log`
-- `train_seed999.log`
+- `train_seed423.log`
+- `train_seed424.log`
