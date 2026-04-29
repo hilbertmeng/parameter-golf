@@ -12,7 +12,7 @@
 | **Mean** | **1.0784** | **1.0769** | **15996987** |
 | **Std** | **0.0005** | **0.0004** | |
 
-Based on SOTA (PR #1493): **1.0810 BPP**. Delta: **-0.0041 BPP ~= 0.0107 nats**. Meets the 0.005-nat threshold.
+Based on SOTA (PR #1493): **1.0810 BPP**. Delta: **-0.0041 BPP ~= -0.0107 nats**. Meets the 0.005-nat threshold.
 
 ## Key Techniques
 
@@ -99,7 +99,7 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 
 ## Acknowledgements
 
-Thanks to ColorfulClouds Tech for providing compute. Thanks to @Lisennlp and @xiaoda99 for valuable discussions on reducing the overhead of MUDD Connections.
+Thanks to **ColorfulClouds Tech** for providing compute. Thanks to **@Lisennlp** and **@xiaoda99** for valuable discussions on reducing the overhead of MUDD Connections.
 
 ## Included Files
 
