@@ -1256,6 +1256,7 @@ class Block(nn.Module):
             else None
         )
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        self.parallel = False
 
     def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0, vm=None, is_recurrent=False, looping_active=False):
         # Records-style recurrent skip (used when MUDD is on but layer-looping
@@ -1296,11 +1297,16 @@ class Block(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             qkvway=qkvway,
-        )
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
-            None, None, :
-        ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        ) * self.attn_scale.to(dtype=x_in.dtype)[None,None,:]
+        if self.parallel:
+            mlp_out=self.mlp(self.mlp_norm(x_in)*self.ln_scale_factor, up_w, down_w)
+            x_out=x_in+attn_out+self.mlp_scale.to(dtype=x_in.dtype)[None,None,:]*mlp_out
+        else:
+            x_out=x_in+attn_out;x_out=x_out+self.mlp_scale.to(dtype=x_out.dtype)[None,None,:]*self.mlp(self.mlp_norm(x_out)*self.ln_scale_factor, up_w, down_w)
+        # x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        # x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
+        #     None, None, :
+        # ] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         return x_out
 
 class GPT(nn.Module):
@@ -1373,6 +1379,9 @@ class GPT(nn.Module):
             for i in range(max(0, h.num_layers - h.xsa_last_n), h.num_layers):
                 self.blocks[i].attn.use_xsa = True
         self.looping_active = False
+        # if h.parallel_start_layer >= 0 and h.use_mudd:
+        #     for i in range(h.parallel_start_layer, h.num_layers):
+        #         self.blocks[i].parallel = True
         if h.num_loops > 0:
             loop_seg = list(range(h.loop_start, h.loop_end + 1))
             all_indices = list(range(h.loop_start))
@@ -1438,13 +1447,13 @@ class GPT(nn.Module):
         # When USE_MUDD=1 we force parallel_start_layer off so all decoder
         # iters take the sequential branch — matching records' single-lane
         # MUDD topology — instead of asserting and crashing.
-        if self.use_mudd and self.parallel_start_layer > 0:
-            print(
-                f"[GPT] USE_MUDD=1: disabling parallel residuals "
-                f"(PARALLEL_START_LAYER {self.parallel_start_layer} -> 0).",
-                flush=True,
-            )
-            self.parallel_start_layer = 0
+        # if self.use_mudd and self.parallel_start_layer > 0:
+        #     print(
+        #         f"[GPT] USE_MUDD=1: disabling parallel residuals "
+        #         f"(PARALLEL_START_LAYER {self.parallel_start_layer} -> 0).",
+        #         flush=True,
+        #     )
+        #     self.parallel_start_layer = 0
         self.mudd_q_dilation = int(h.mudd_q_dilation) if self.use_mudd else 1
         self.mudd_k_dilation = int(h.mudd_k_dilation) if self.use_mudd else 1
         self.mudd_emb = None
@@ -1507,11 +1516,11 @@ class GPT(nn.Module):
             # Decoder iteration index at which the parallel-residual lanes kick
             # in (-1 if MUDD covers no parallel layers). Layers >= this iteration
             # are processed by _parallel_block and IGNORE the vm produced for them.
-            psl = self.parallel_start_layer
-            for k, blk_idx in enumerate(self.decoder_indices):
-                if blk_idx >= psl and psl > 0:
-                    self._mudd_parallel_start_iter = len(self.encoder_indices) + k
-                    break
+            # psl = self.parallel_start_layer
+            # for k, blk_idx in enumerate(self.decoder_indices):
+            #     if blk_idx >= psl and psl > 0:
+            #         self._mudd_parallel_start_iter = len(self.encoder_indices) + k
+            #         break
         # `is_recur_indices` (records lines 234-241): per looped-iteration-position
         # boolean. True iff the underlying block index has already appeared at an
         # earlier iteration (excluding the immediately-preceding one — records uses
@@ -1601,8 +1610,11 @@ class GPT(nn.Module):
     def _parallel_block(
         self, block_idx, lane0, lane1, x0,
         q_w, k_w, v_w, out_w, up_w, down_w,
-        cu_seqlens=None, max_seqlen=0,
+        cu_seqlens=None, max_seqlen=0, vm=None,
+        is_recur=False, looping_active=False,
     ):
+        if is_recur and not looping_active:
+            return lane0, lane1
         block = self.blocks[block_idx]
         # KEEP_UNET=0: drop the per-block x0 fold-in on the attention lane.
         if block.resid_mix is None:
@@ -1610,12 +1622,22 @@ class GPT(nn.Module):
         else:
             mix = block.resid_mix.to(dtype=lane0.dtype)
             attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
+        qkvway = None
+        ffnway = None
+        if vm is not None:
+            if isinstance(vm, tuple):
+                qkvway = vm[:-1]
+                ffnway = vm[-1]
+            else:
+                attn_read = attn_read + vm
         attn_out = block.attn(
             block.attn_norm(attn_read) * block.ln_scale_factor,
             q_w, k_w, v_w, out_w,
-            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, qkvway=qkvway,
         )
         attn_out = block.attn_scale.to(dtype=attn_out.dtype)[None, None, :] * attn_out
+        if ffnway is not None:
+            lane1 = lane1 + ffnway
         mlp_read = lane1
         mlp_out = block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * block.mlp(
             block.mlp_norm(mlp_read) * block.ln_scale_factor, up_w, down_w
@@ -1750,11 +1772,11 @@ class GPT(nn.Module):
                     else:
                         lane0 = lane0 + w * skip
                 # Recurrent-skip parallel iter: lanes pass through unchanged.
-                if not (is_recur and not looping_now):
-                    lane0, lane1 = self._parallel_block(
-                        i, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w,
-                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                    )
+                # if not (is_recur and not looping_now):
+                lane0, lane1 = self._parallel_block(
+                    i, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, vm=vm, is_recur=is_recur, looping_active=looping_now,
+                )
                 # Keep MUDD bookkeeping in sync with the position in the looped
                 # decoder index list, but use the parallel lane mix as the
                 # hidden-state representative for downstream MUDD blocks.
@@ -1787,13 +1809,13 @@ class GPT(nn.Module):
                     else:
                         vm = None
                     mudd_idx += 1
+        if lane0 is not None:
+            x = self._final_parallel_hidden(lane0, lane1)
         if self.use_mudd and vm is not None:
             # Records adds the final vm into the residual (line 309-310).
             # 1-way (last_layer) returns a single tensor; multi-way returns a
             # tuple — collapse to the last way (the "mlp_way") for the residual.
             x = (vm[-1] if isinstance(vm, tuple) else vm) + x
-        if lane0 is not None:
-            x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
         return x
 
@@ -3870,6 +3892,9 @@ def train_model(h, device, val_data):
     )
     model = compiled_model
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
+    if h.is_main_process:
+        for n, p in base_model.named_parameters():
+            print(n, p.shape, p.dtype, p.mean().item(), p.std().item())
     if getattr(base_model, "use_mudd", False):
         log(
             f"mudd:enabled q_indices={base_model.mudd_q_indices} "
@@ -3944,9 +3969,9 @@ def train_model(h, device, val_data):
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * lr_scale
         if h.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(_clip_params, h.grad_clip_norm)
+            raw_grad_norm = torch.nn.utils.clip_grad_norm_(_clip_params, h.grad_clip_norm)
         optimizers.step(distributed=h.distributed)
-        return train_loss
+        return train_loss, raw_grad_norm
 
     if h.warmup_steps > 0:
         initial_model_state = {
@@ -4062,7 +4087,7 @@ def train_model(h, device, val_data):
             log(
                 f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}"
             )
-        train_loss = step_fn(step, scale)
+        train_loss, raw_grad_norm = step_fn(step, scale)
         with torch.no_grad():
             for ema_t, t in _ema_pairs:
                 ema_t.mul_(ema_decay).add_(t.detach(), alpha=1.0 - ema_decay)
@@ -4074,7 +4099,7 @@ def train_model(h, device, val_data):
         if should_log_train:
             tok_per_sec = step * h.train_batch_tokens / (approx_training_time_ms / 1e3)
             log(
-                f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} step_avg:{approx_training_time_ms/step:.2f}ms train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}"
+                f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} raw_grad_norm: {raw_grad_norm:.4f} step_avg:{approx_training_time_ms/step:.2f}ms train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}"
             )
         reached_cap = (
             max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
