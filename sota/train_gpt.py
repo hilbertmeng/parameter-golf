@@ -1379,9 +1379,9 @@ class GPT(nn.Module):
             for i in range(max(0, h.num_layers - h.xsa_last_n), h.num_layers):
                 self.blocks[i].attn.use_xsa = True
         self.looping_active = False
-        # if h.parallel_start_layer >= 0 and h.use_mudd:
-        #     for i in range(h.parallel_start_layer, h.num_layers):
-        #         self.blocks[i].parallel = True
+        if h.parallel_start_layer >= 0 and h.use_mudd:
+            for i in range(h.parallel_start_layer, h.num_layers):
+                self.blocks[i].parallel = True
         if h.num_loops > 0:
             loop_seg = list(range(h.loop_start, h.loop_end + 1))
             all_indices = list(range(h.loop_start))
@@ -1479,9 +1479,7 @@ class GPT(nn.Module):
             # parallel_start_layer=0 above, so every iter takes the sequential
             # branch in _forward_hidden and every dynamic_dense module is
             # invoked.
-            self.mudd_q_indices = [
-                i for i in [2, 4, 6, 8, 10, 12, 15, 16] if i < looped_num_layers
-            ]
+            self.mudd_q_indices = [2, 4, 6, 8, 10, 12, 15, 16] 
             # Optional extra mudd_emb embedding lookup. Skipped by default — see
             # the hparam comment about GPTQ passthrough.
             num_base_layers = 1
@@ -1493,6 +1491,21 @@ class GPT(nn.Module):
                 num_base_layers = 2
             # local_window_sizes: records' stride-4 pattern [None, None, 2, None] * 5.
             local_window_sizes = ([None, None, 2, None] * 5)[:looped_num_layers]
+            
+            # replace with the following
+            # self.mudd_q_indices = [2, 4, 6, 8, 10, 12, 15, 16] 
+            # local_window_sizes = ([None, None, 2, None] * 5)[:looped_num_layers]
+            # self.num_ways = [1]*12 + [2] * 5
+            
+            # base2 
+            # self.mudd_q_indices = [2, 4, 6, 8, 10, 12, 13, 14, 15, 16] 
+            # local_window_sizes = [None, None, 2, None] * 3 + [6, 3, 3, 6, None]
+            # self.num_ways = [1]*12 + [2] * 5
+            # base3 
+            # self.mudd_q_indices = [2, 4, 6, 8, 10, 12, 15, 16] 
+            # local_window_sizes = [None, None, 2, None] * 1 + [4] * 3 + [None]
+            # self.num_ways = [1]*12 + [2] * 5
+
             ddense = []
             for i in range(looped_num_layers):
                 if i in self.mudd_q_indices:
@@ -1630,6 +1643,7 @@ class GPT(nn.Module):
                 ffnway = vm[-1]
             else:
                 attn_read = attn_read + vm
+                ffnway = vm
         attn_out = block.attn(
             block.attn_norm(attn_read) * block.ln_scale_factor,
             q_w, k_w, v_w, out_w,
@@ -1753,7 +1767,7 @@ class GPT(nn.Module):
                 and (not is_recur or looping_now)
             )
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            if i >= psl and psl > 0:
+            if i >= psl and psl > 0 and not self.use_mudd:
                 # Parallel-residual decoder layer. MUDD `vm` is intentionally
                 # NOT threaded into _parallel_block (the two-lane semantics
                 # don't have an obvious mapping for qkvway / mlp_way); we
@@ -1781,8 +1795,14 @@ class GPT(nn.Module):
                 # decoder index list, but use the parallel lane mix as the
                 # hidden-state representative for downstream MUDD blocks.
                 if self.use_mudd:
+                    x = lane1
                     if mudd_idx % self.mudd_k_dilation == 0:
-                        hiddens.append(self._final_parallel_hidden(lane0, lane1))
+                        hiddens.append(x)
+                    if mudd_idx in self.mudd_q_indices:
+                        dd = self.dynamic_dense[mudd_idx]
+                        vm = dd.layer_mix(x, hiddens, dd(x))
+                    else:
+                        vm = None
                     mudd_idx += 1
             else:
                 if consume_skip:
@@ -1952,11 +1972,17 @@ class GPT(nn.Module):
                 if not (is_recur and not looping_now):
                     lane0, lane1 = self._parallel_block_with_lora(
                         i, lane0, lane1, x0, lora, slot,
-                        q_w, k_w, v_w, out_w, up_w, down_w,
+                        q_w, k_w, v_w, out_w, up_w, down_w, vm=vm,
                     )
                 if self.use_mudd:
+                    x = lane1 
                     if mudd_idx % self.mudd_k_dilation == 0:
-                        hiddens.append(self._final_parallel_hidden(lane0, lane1))
+                        hiddens.append(x)
+                    if mudd_idx in self.mudd_q_indices:
+                        dd = self.dynamic_dense[mudd_idx]
+                        vm = dd.layer_mix(x, hiddens, dd(x))
+                    else:
+                        vm = None
                     mudd_idx += 1
             else:
                 if consume_skip:
@@ -2532,39 +2558,66 @@ class Optimizers:
             opt.zero_grad(set_to_none=True)
 
     def _all_reduce_packed_grads(self):
-        grads_by_key = collections.defaultdict(list)
+        params_by_key = collections.defaultdict(list)
         for p in self.replicated_packed_params:
-            if p.grad is not None:
-                grads_by_key[(p.grad.device, p.grad.dtype)].append(p.grad)
-        for grads in grads_by_key.values():
+            dtype = p.grad.dtype if p.grad is not None else p.dtype
+            params_by_key[(p.device, dtype)].append(p)
+        for params in params_by_key.values():
             flat = torch.empty(
-                sum(g.numel() for g in grads),
-                device=grads[0].device,
-                dtype=grads[0].dtype,
+                sum(p.numel() for p in params),
+                device=params[0].device,
+                dtype=params[0].grad.dtype if params[0].grad is not None else params[0].dtype,
+            )
+            has_grad = torch.empty(
+                len(params), device=flat.device, dtype=torch.int32
             )
             offset = 0
-            for g in grads:
-                n = g.numel()
-                flat[offset : offset + n].copy_(g.contiguous().view(-1))
+            for i, p in enumerate(params):
+                n = p.numel()
+                if p.grad is None:
+                    flat[offset : offset + n].zero_()
+                    has_grad[i] = 0
+                else:
+                    flat[offset : offset + n].copy_(p.grad.contiguous().view(-1))
+                    has_grad[i] = 1
                 offset += n
+            dist.all_reduce(has_grad, op=dist.ReduceOp.SUM)
             dist.all_reduce(flat, op=dist.ReduceOp.AVG)
             offset = 0
-            for g in grads:
-                n = g.numel()
-                g.copy_(flat[offset : offset + n].view_as(g))
+            for i, p in enumerate(params):
+                n = p.numel()
+                if has_grad[i].item() > 0:
+                    if p.grad is None:
+                        p.grad = torch.empty_like(p)
+                    p.grad.copy_(flat[offset : offset + n].view_as(p))
+                else:
+                    p.grad = None
                 offset += n
+
+    def _all_reduce_large_grads(self):
+        for p in self.replicated_large_params:
+            has_grad = torch.tensor(
+                int(p.grad is not None), device=p.device, dtype=torch.int32
+            )
+            if p.grad is None:
+                grad = torch.zeros_like(p)
+            else:
+                grad = p.grad
+            dist.all_reduce(has_grad, op=dist.ReduceOp.SUM)
+            dist.all_reduce(grad, op=dist.ReduceOp.AVG)
+            if has_grad.item() > 0:
+                if p.grad is None:
+                    p.grad = grad
+                else:
+                    p.grad.copy_(grad)
+            else:
+                p.grad = None
 
     def step(self, distributed=False):
         self.optimizer_muon.launch_reduce_scatters()
         if distributed:
-            reduce_handles = [
-                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True)
-                for p in self.replicated_large_params
-                if p.grad is not None
-            ]
+            self._all_reduce_large_grads()
             self._all_reduce_packed_grads()
-            for handle in reduce_handles:
-                handle.wait()
         self._aux_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._aux_stream):
             self.optimizer_tok.step()
@@ -4308,10 +4361,10 @@ def main():
             if not k.startswith("_"):
                 log(f"  {k}: {v}", console=True)
         log("=" * 100, console=False)
-        log("Source code:", console=False)
-        log("=" * 100, console=False)
-        with open(__file__, "r", encoding="utf-8") as _src:
-            log(_src.read(), console=False)
+        # log("Source code:", console=False)
+        # log("=" * 100, console=False)
+        # with open(__file__, "r", encoding="utf-8") as _src:
+        #     log(_src.read(), console=False)
         log("=" * 100, console=False)
         log(f"Running Python {sys.version}", console=False)
         log(f"Running PyTorch {torch.__version__}", console=False)
