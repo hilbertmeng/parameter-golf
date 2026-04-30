@@ -366,6 +366,33 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
+    # MUDD (Multiway Dynamic Dense connections, ported from
+    # records/track_10min_16mb/2026-04-29_MUDD_Connections/train_gpt.py).
+    # USE_MUDD=1 inserts a MultiwayDynamicDenseBlock at selected positions of the
+    # (looped) layer sequence. Each block computes per-token dynamic weights that
+    # mix all preceding hiddens (and an optional per-token mudd_emb) into 1-, 2-,
+    # 3-, or 4-way outputs. Way[-1] is added to the residual stream entering the
+    # block (the 'mlp_way'); the remaining ways are added to the inputs of the
+    # Q/K/V projections of the next attention layer. Default OFF — preserves
+    # existing SOTA behavior bit-for-bit. When ON, MUDD is skipped at decoder
+    # layers >= PARALLEL_START_LAYER (parallel-residual lanes are not threaded
+    # through MUDD); set PARALLEL_START_LAYER high enough to cover all your
+    # MUDD q-positions if that matters. Also forces looping_active=True from
+    # step 0 (no looping warmup-skip semantics — MUDD sees the full looped stack
+    # always), which means h.enable_looping_at is ignored when use_mudd is on.
+    use_mudd = bool(int(os.environ.get("USE_MUDD", "0")))
+    mudd_q_dilation = int(os.environ.get("MUDD_Q_DILATION", "1"))
+    mudd_k_dilation = int(os.environ.get("MUDD_K_DILATION", "1"))
+    # MUDD_EMB=1 adds an additional learned embedding lookup whose value seeds
+    # the MUDD `hiddens` list (in addition to the post-RMSNorm tok_emb hidden).
+    # Default OFF: when ON, mudd_emb.weight is (vocab, model_dim) which is too
+    # large for the GPTQ passthrough threshold (>65536 numel) and would hit the
+    # GPTQ path without a hessian. Leave OFF unless you also extend
+    # collect_hessians + gptq_mixed_quantize to handle it.
+    mudd_emb = bool(int(os.environ.get("MUDD_EMB", "0")))
+    mudd_init_std = float(os.environ.get("MUDD_INIT_STD", "0.006"))
+    mudd_scale_init = float(os.environ.get("MUDD_SCALE_INIT", "0.01"))
+    keep_unet = bool(int(os.environ.get("KEEP_UNET", "1")))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -938,6 +965,79 @@ def apply_rotary_emb(x, cos, sin, rope_dims=0):
     return torch.cat((x1 * cos + x2 * sin, x1 * -sin + x2 * cos), dim=-1)
 
 
+class MultiwayDynamicDenseBlock(nn.Module):
+    """MUDD block: per-token dynamic dense weights over preceding hiddens.
+
+    Ported from records/track_10min_16mb/2026-04-29_MUDD_Connections/train_gpt.py
+    (the einops `rearrange` is replaced with reshape+permute to avoid the
+    extra dependency).
+
+    Forward: x -> dw of shape (C, B, T, L), where C is the number of ways
+    (C=1 for a "last_layer" block, otherwise = num_ways) and L is the number
+    of preceding hiddens this block aggregates over.
+    `layer_mix(x, all_hids, dw)` then computes a per-way RMSNorm'd weighted
+    sum scaled by per-way scalar `scale`, returning either a single tensor
+    (C=1) or a length-C tuple.
+    """
+
+    def __init__(self, dim, lidx, last_layer=False, multiway=False,
+                 k_dilation=1, base_layer=1, num_ways=4,
+                 local_window_size=None, init_std=0.006, scale_init=0.01):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.C = (num_ways if not last_layer else 1) if multiway else 1
+        self.lidx = lidx
+        if local_window_size is None:
+            l = base_layer + (lidx + 1) // k_dilation
+        else:
+            l = local_window_size
+        self.local_window_size = local_window_size
+        self.dim = dim
+        hid_dim = l * self.C
+        out_dim = l * self.C
+        # Use plain Linear (no _zero_init on w1) — kept as a fp32 Linear so
+        # restore_fp32_params (CastedLinear-only walk) doesn't touch it but
+        # weights are fp32 by default.
+        self.w1 = CastedLinear(dim, hid_dim, bias=False)
+        # w1 init: small normal (matches records' name-pattern check on
+        # 'dynamic_dense'); see GPT._init_weights below.
+        self.act = nn.GELU()
+        self.w2 = CastedLinear(hid_dim, out_dim, bias=True)
+        self.w2._zero_init = True
+        self.w2.bias.data.fill_(0.0)
+        self.mudd_scale = scale_init
+        self.scale = nn.Parameter(
+            torch.ones(dim * self.C, dtype=torch.float32) * self.mudd_scale
+        )
+        # Stash for the explicit init pass.
+        self._init_std = init_std
+
+    def forward(self, x):
+        # Returns dw of shape (C, B, T, L). The reshape+permute below replaces
+        # records' `rearrange('B T (C L) -> C B T L', C=self.C)` exactly.
+        x = self.norm(x)
+        dw = self.w2(self.act(self.w1(x)))
+        B, T, CL = dw.shape
+        L = CL // self.C
+        return dw.view(B, T, self.C, L).permute(2, 0, 1, 3).contiguous()
+
+    def layer_mix(self, x, all_hids, dw, hidden_masks=None):
+        L = dw.shape[3]
+        # Choose which subset of `all_hids` to aggregate over. Matches records.
+        if L == 1:
+            hids = all_hids[:1]
+        elif L > 2:
+            hids = all_hids[:1] + all_hids[-(L - 2):] + all_hids[-1:]
+        else:
+            hids = all_hids[:1] + all_hids[-1:]
+        scale = self.scale.to(dtype=hids[0].dtype).view(self.C, 1, 1, -1)
+        weighted = dw[:, :, :, 0, None] * hids[0]
+        for j in range(1, L):
+            weighted = weighted + dw[:, :, :, j, None] * hids[j]
+        result = F.rms_norm(weighted, (weighted.size(-1),)) * scale
+        return tuple(result[c] for c in range(self.C)) if self.C > 1 else result[0]
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len, yarn=True,
@@ -1009,14 +1109,39 @@ class CausalSelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
 
-    def forward(self, x, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0):
+    def forward(self, x, q_w, k_w, v_w, out_w, cu_seqlens=None, max_seqlen=0, qkvway=None):
         bsz, seqlen, dim = x.shape
         # q_raw kept around as a tap point for attn_out_gate_src='q' (post-projection,
         # pre-reshape, pre-RoPE).
-        q_raw = F.linear(x, q_w.to(x.dtype))
+        # MUDD `qkvway`: optional tuple of length 1, 2, or 3. Each entry is added
+        # to the input of the matching projection BEFORE F.linear (matches the
+        # records/MUDD semantics):
+        #   len=1 -> way0 added to V input only
+        #   len=2 -> way0 added to Q&K, way1 added to V
+        #   len=3 -> way0 to Q, way1 to K, way2 to V
+        # qkvway entries are pre-norm hidden-shaped tensors (B, T, dim).
+        if qkvway is None:
+            xq = xk = xv = x
+        else:
+            n = len(qkvway)
+            if n == 1:
+                xq = x
+                xk = x
+                xv = x + qkvway[0]
+            elif n == 2:
+                xq = x + qkvway[0]
+                xk = x + qkvway[0]
+                xv = x + qkvway[1]
+            elif n == 3:
+                xq = x + qkvway[0]
+                xk = x + qkvway[1]
+                xv = x + qkvway[2]
+            else:
+                raise ValueError(f"qkvway must have length 1, 2, or 3; got {n}")
+        q_raw = F.linear(xq, q_w.to(x.dtype))
         q = q_raw.reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        k = F.linear(x, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = F.linear(x, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        k = F.linear(xk, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = F.linear(xv, v_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -1103,6 +1228,7 @@ class Block(nn.Module):
         sparse_attn_gate=False,
         sparse_attn_gate_init_std=0.0,
         sparse_attn_gate_scale=1.0,
+        keep_unet=True,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1118,19 +1244,58 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(
-            torch.stack((torch.ones(dim), torch.zeros(dim))).float()
+        # `resid_mix` (records lines 177/182-186): per-channel learned mix
+        # between the previous-layer hidden `x` and the post-embedding `x0`
+        # (the U-Net "encoder seed"). When KEEP_UNET=0, the mix tensor is
+        # dropped and Block.forward bypasses the x0 fold-in entirely
+        # (x_in = x), so the model is a plain residual stack with no U-Net.
+        self.keep_unet = bool(keep_unet)
+        self.resid_mix = (
+            nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+            if self.keep_unet
+            else None
         )
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
-    def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0):
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=None, max_seqlen=0, vm=None, is_recurrent=False, looping_active=False):
+        # Records-style recurrent skip (used when MUDD is on but layer-looping
+        # has not yet been enabled). When `is_recurrent` AND `not looping_active`
+        # this block is a pure pass-through so MUDD's bookkeeping (which always
+        # iterates over the looped sequence) does not double-execute repeated
+        # block indices during the pre-loop training phase.
+        if is_recurrent and not looping_active:
+            return x
+        # KEEP_UNET=0: skip the x0 fold-in. Matches records' Block.forward
+        # `if self.resid_mix is None: x_in = x` branch.
+        if self.resid_mix is None:
+            x_in = x
+        else:
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        # MUDD `vm` (value-and-mlp way). Records semantics:
+        #   - if `vm` is a tuple of length C>=2: the first C-1 entries become
+        #     the attention `qkvway`, attn_norm runs on x_in BEFORE adding the
+        #     last way, and then the last way ("mlp_way") is added to x_in so
+        #     it lands in the residual stream entering the MLP.
+        #   - if `vm` is a single tensor (1-way / last_layer): it is added to
+        #     x_in BEFORE attn_norm, so attention sees the shifted residual.
+        qkvway = None
+        if vm is not None:
+            if isinstance(vm, tuple):
+                qkvway = vm[:-1]
+                normed = self.attn_norm(x_in) * self.ln_scale_factor
+                x_in = x_in + vm[-1]
+            else:
+                x_in = x_in + vm
+                normed = self.attn_norm(x_in) * self.ln_scale_factor
+        else:
+            normed = self.attn_norm(x_in) * self.ln_scale_factor
         attn_out = self.attn(
-            self.attn_norm(x_in) * self.ln_scale_factor,
+            normed,
             q_w, k_w, v_w, out_w,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            qkvway=qkvway,
         )
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[
@@ -1179,10 +1344,12 @@ class GPT(nn.Module):
                     sparse_attn_gate=h.sparse_attn_gate_enabled,
                     sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
                     sparse_attn_gate_scale=h.sparse_attn_gate_scale,
+                    keep_unet=h.keep_unet,
                 )
                 for i in range(h.num_layers)
             ]
         )
+        self.keep_unet = bool(h.keep_unet)
         if h.rope_dims > 0:
             head_dim = h.model_dim // h.num_heads
             for block in self.blocks:
@@ -1218,19 +1385,29 @@ class GPT(nn.Module):
         else:
             self.encoder_indices = list(range(self.num_encoder_layers))
             self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
-        self.num_skip_weights = min(
-            len(self.encoder_indices), len(self.decoder_indices)
-        )
-        self.skip_weights = nn.Parameter(
-            torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32)
-        )
-        self.skip_gates = (
-            nn.Parameter(
-                torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)
+        # U-Net skip weights/gates. KEEP_UNET=0 disables them entirely:
+        # `skip_weights`/`skip_gates` are None and `num_skip_weights` is 0,
+        # so the encoder skip stack is never populated and the decoder
+        # skip-merge step is a no-op (matches records' `if h.keep_unet`
+        # gating around the skip parameters).
+        if h.keep_unet:
+            self.num_skip_weights = min(
+                len(self.encoder_indices), len(self.decoder_indices)
             )
-            if h.skip_gates_enabled
-            else None
-        )
+            self.skip_weights = nn.Parameter(
+                torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32)
+            )
+            self.skip_gates = (
+                nn.Parameter(
+                    torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)
+                )
+                if h.skip_gates_enabled
+                else None
+            )
+        else:
+            self.num_skip_weights = 0
+            self.skip_weights = None
+            self.skip_gates = None
         self.parallel_start_layer = h.parallel_start_layer
         self.parallel_final_lane = h.parallel_final_lane.lower()
         self.parallel_post_lambdas = nn.Parameter(
@@ -1249,11 +1426,125 @@ class GPT(nn.Module):
             self.smear_gate = CastedLinear(self.smear_window, 1, bias=False)
             self.smear_gate._zero_init = True
             self.smear_lambda = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        # MUDD (Multiway Dynamic Dense connections). Off by default.
+        # When ON, we always use the looped (encoder_indices, decoder_indices)
+        # iteration order — ENABLE_LOOPING_AT is ignored — and a
+        # MultiwayDynamicDenseBlock fires at each `mudd_q_indices` position to
+        # produce a `vm` that is consumed by the NEXT block via Block.forward(vm=...).
+        self.use_mudd = bool(h.use_mudd)
+        # MUDD and the parallel-residual two-lane path are mutually exclusive
+        # (the parallel branch in _forward_hidden does not thread `vm` and
+        # would silently drop MUDD's contribution at every parallel iter).
+        # When USE_MUDD=1 we force parallel_start_layer off so all decoder
+        # iters take the sequential branch — matching records' single-lane
+        # MUDD topology — instead of asserting and crashing.
+        if self.use_mudd and self.parallel_start_layer > 0:
+            print(
+                f"[GPT] USE_MUDD=1: disabling parallel residuals "
+                f"(PARALLEL_START_LAYER {self.parallel_start_layer} -> 0).",
+                flush=True,
+            )
+            self.parallel_start_layer = 0
+        self.mudd_q_dilation = int(h.mudd_q_dilation) if self.use_mudd else 1
+        self.mudd_k_dilation = int(h.mudd_k_dilation) if self.use_mudd else 1
+        self.mudd_emb = None
+        self.dynamic_dense = nn.ModuleList()
+        self.mudd_q_indices = []
+        self.num_ways = []
+        self._mudd_parallel_start_iter = -1  # set below
+        if self.use_mudd:
+            looped_num_layers = len(self.encoder_indices) + len(self.decoder_indices)
+            # Per-layer-position number of ways. records uses [1]*12 + [2]*5 for
+            # the canonical (NUM_LAYERS=11, num_loops=2, loop_start=3, loop_end=5)
+            # configuration which produces looped_num_layers=17. We replicate that
+            # split here and then pad/truncate to looped_num_layers; if the user
+            # changes the loop topology, MUDD ways outside [0, len-1] are dropped.
+            base_num_ways = [1] * 12 + [2] * 5
+            if looped_num_layers <= len(base_num_ways):
+                self.num_ways = base_num_ways[:looped_num_layers]
+            else:
+                self.num_ways = base_num_ways + [2] * (looped_num_layers - len(base_num_ways))
+            # MUDD activation positions in the looped iteration order. Same
+            # canonical list as records — kept inside [0, looped_num_layers-1].
+            # No psl-based filtering needed: USE_MUDD=1 forces
+            # parallel_start_layer=0 above, so every iter takes the sequential
+            # branch in _forward_hidden and every dynamic_dense module is
+            # invoked.
+            self.mudd_q_indices = [
+                i for i in [2, 4, 6, 8, 10, 12, 15, 16] if i < looped_num_layers
+            ]
+            # Optional extra mudd_emb embedding lookup. Skipped by default — see
+            # the hparam comment about GPTQ passthrough.
+            num_base_layers = 1
+            if h.mudd_emb:
+                self.num_mudd_embs = 1
+                self.mudd_emb = nn.Embedding(
+                    h.vocab_size, h.model_dim * self.num_mudd_embs
+                )
+                num_base_layers = 2
+            # local_window_sizes: records' stride-4 pattern [None, None, 2, None] * 5.
+            local_window_sizes = ([None, None, 2, None] * 5)[:looped_num_layers]
+            ddense = []
+            for i in range(looped_num_layers):
+                if i in self.mudd_q_indices:
+                    ddense.append(
+                        MultiwayDynamicDenseBlock(
+                            h.model_dim,
+                            i,
+                            last_layer=(i == looped_num_layers - 1),
+                            multiway=True,
+                            k_dilation=self.mudd_k_dilation,
+                            base_layer=num_base_layers,
+                            num_ways=self.num_ways[i],
+                            local_window_size=local_window_sizes[i],
+                            init_std=h.mudd_init_std,
+                            scale_init=h.mudd_scale_init,
+                        )
+                    )
+                else:
+                    ddense.append(None)
+            self.dynamic_dense = nn.ModuleList(ddense)
+            # Decoder iteration index at which the parallel-residual lanes kick
+            # in (-1 if MUDD covers no parallel layers). Layers >= this iteration
+            # are processed by _parallel_block and IGNORE the vm produced for them.
+            psl = self.parallel_start_layer
+            for k, blk_idx in enumerate(self.decoder_indices):
+                if blk_idx >= psl and psl > 0:
+                    self._mudd_parallel_start_iter = len(self.encoder_indices) + k
+                    break
+        # `is_recur_indices` (records lines 234-241): per looped-iteration-position
+        # boolean. True iff the underlying block index has already appeared at an
+        # earlier iteration (excluding the immediately-preceding one — records uses
+        # `j in all_indices[:i-1]`). When a position is "recurrent" AND
+        # `looping_active=False` (which is the state during the early training
+        # phase, before `frac >= h.enable_looping_at`), the corresponding block
+        # call becomes a no-op — see Block.forward below. This lets MUDD coexist
+        # with the existing loop-warmup pattern: MUDD always uses the looped
+        # iteration order (because dynamic_dense is sized to it) but the
+        # recurrent re-executions are deferred until the loop actually turns on.
+        # Always created (length = looped_num_layers) so downstream code can
+        # index unconditionally; left all-False when use_mudd=False so non-MUDD
+        # paths see no behavioral change.
+        all_indices_full = list(self.encoder_indices) + list(self.decoder_indices)
+        is_recur = [False] * len(all_indices_full)
+        if self.use_mudd:
+            for i, j in enumerate(all_indices_full):
+                if i == 0:
+                    is_recur[i] = False
+                else:
+                    is_recur[i] = j in all_indices_full[: i - 1]
+        self.is_recur_indices = is_recur
         self._init_weights()
 
     def _init_weights(self):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        # MUDD's optional extra embedding: initialized with the same small
+        # normal as the tied tok_emb (records uses tied_embed_init_std too).
+        if self.mudd_emb is not None:
+            nn.init.normal_(
+                self.mudd_emb.weight, mean=0.0, std=self.tied_embed_init_std
+            )
         n = self.num_layers
         proj_scale = 1.0 / math.sqrt(2 * n)
         for i in range(n):
@@ -1270,6 +1561,25 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
                     nn.init.zeros_(module.weight)
+                # MUDD w1: small-normal init (records uses 0.006). Must be
+                # checked BEFORE the orthogonal branch because (model_dim,
+                # hid_dim*C) easily satisfies the >=64 bound but is small
+                # enough that orthogonal init makes the dynamic weights too
+                # large at step 0.
+                elif "dynamic_dense" in name and ".w1." in (name + "."):
+                    std = getattr(module, "_init_std", None)
+                    if std is None:
+                        # Walk back up to the parent MultiwayDynamicDenseBlock
+                        # to grab its _init_std (set in __init__).
+                        std = 0.006
+                        for _n, _m in self.named_modules():
+                            if (
+                                isinstance(_m, MultiwayDynamicDenseBlock)
+                                and name.startswith(_n + ".")
+                            ):
+                                std = float(_m._init_std)
+                                break
+                    nn.init.normal_(module.weight, mean=0.0, std=std)
                 elif (
                     module.weight.ndim == 2
                     and module.weight.shape[0] >= 64
@@ -1294,8 +1604,12 @@ class GPT(nn.Module):
         cu_seqlens=None, max_seqlen=0,
     ):
         block = self.blocks[block_idx]
-        mix = block.resid_mix.to(dtype=lane0.dtype)
-        attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
+        # KEEP_UNET=0: drop the per-block x0 fold-in on the attention lane.
+        if block.resid_mix is None:
+            attn_read = lane0
+        else:
+            mix = block.resid_mix.to(dtype=lane0.dtype)
+            attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
         attn_out = block.attn(
             block.attn_norm(attn_read) * block.ln_scale_factor,
             q_w, k_w, v_w, out_w,
@@ -1338,33 +1652,96 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips = []
+        # MUDD requires the looped (encoder_indices/decoder_indices) iteration
+        # order from step 0 — the dynamic_dense list is sized to that order.
+        use_looped_iter = self.looping_active or self.use_mudd
         enc_iter = (
             self.encoder_indices
-            if self.looping_active
+            if use_looped_iter
             else range(self.num_encoder_layers)
         )
         dec_iter = (
             self.decoder_indices
-            if self.looping_active
+            if use_looped_iter
             else range(
                 self.num_encoder_layers,
                 self.num_encoder_layers + self.num_decoder_layers,
             )
         )
-        for i in enc_iter:
+        # MUDD bookkeeping. `hiddens` accumulates the rms-normed embedding (and
+        # optional mudd_emb) and the post-block output of each layer; `vm` is
+        # the dynamic-dense output produced by the PREVIOUS MUDD-active layer
+        # and consumed by the current block via Block.forward(vm=...).
+        hiddens = []
+        vm = None
+        if self.use_mudd:
+            if self.mudd_emb is not None:
+                me = self.mudd_emb(input_ids)
+                edim = self.tok_emb.embedding_dim
+                for ei in range(self.num_mudd_embs):
+                    hiddens.append(F.rms_norm(
+                        me[:, :, ei * edim : (ei + 1) * edim], (edim,)
+                    ))
+            hiddens.append(x)
+        # Recurrent-skip mask aligned with the looped iteration order. When
+        # use_looped_iter is False (use_mudd=False AND looping_active=False) the
+        # iteration is a straight range over actual block indices, none of
+        # which repeat — so we use an all-False mask of the matching length.
+        if use_looped_iter:
+            recur_mask = self.is_recur_indices
+        else:
+            recur_mask = [False] * (len(enc_iter) + len(dec_iter))
+        looping_now = bool(self.looping_active)
+        # KEEP_UNET=0: skip the U-Net entirely. The encoder skip stack is
+        # never populated; the decoder branch is already gated on
+        # `skip_idx < self.num_skip_weights` (=0 in this mode) via
+        # `consume_skip` so no skip pop attempts.
+        keep_unet = self.skip_weights is not None
+        mudd_idx = 0
+        for it_idx, i in enumerate(enc_iter):
+            is_recur = recur_mask[it_idx]
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-            skips.append(x)
+            x = self.blocks[i](
+                x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, vm=vm,
+                is_recurrent=is_recur, looping_active=looping_now,
+            )
+            if keep_unet:
+                skips.append(x)
+            if self.use_mudd:
+                if mudd_idx % self.mudd_k_dilation == 0:
+                    hiddens.append(x)
+                if mudd_idx in self.mudd_q_indices:
+                    dd = self.dynamic_dense[mudd_idx]
+                    vm = dd.layer_mix(x, hiddens, dd(x))
+                else:
+                    vm = None
+                mudd_idx += 1
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
+        enc_len = len(enc_iter)
         for skip_idx, i in enumerate(dec_iter):
+            is_recur = recur_mask[enc_len + skip_idx]
+            # Records gates the U-Net skip pop on `not is_recur OR looping_active`
+            # so that pre-loop recurrent positions neither pop a skip nor mutate x.
+            consume_skip = (
+                skip_idx < self.num_skip_weights
+                and skips
+                and (not is_recur or looping_now)
+            )
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
+                # Parallel-residual decoder layer. MUDD `vm` is intentionally
+                # NOT threaded into _parallel_block (the two-lane semantics
+                # don't have an obvious mapping for qkvway / mlp_way); we
+                # reset vm to None here so the next sequential layer (if any)
+                # doesn't accidentally reuse a stale vm from the encoder.
+                vm = None
                 if lane0 is None:
                     lane0 = x
                     lane1 = x
-                if skip_idx < self.num_skip_weights and skips:
+                if consume_skip:
                     skip = skips.pop()
                     w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
                     if self.skip_gates is not None:
@@ -1372,12 +1749,21 @@ class GPT(nn.Module):
                         lane0 = torch.lerp(w * skip, lane0, g)
                     else:
                         lane0 = lane0 + w * skip
-                lane0, lane1 = self._parallel_block(
-                    i, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w,
-                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                )
+                # Recurrent-skip parallel iter: lanes pass through unchanged.
+                if not (is_recur and not looping_now):
+                    lane0, lane1 = self._parallel_block(
+                        i, lane0, lane1, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    )
+                # Keep MUDD bookkeeping in sync with the position in the looped
+                # decoder index list, but use the parallel lane mix as the
+                # hidden-state representative for downstream MUDD blocks.
+                if self.use_mudd:
+                    if mudd_idx % self.mudd_k_dilation == 0:
+                        hiddens.append(self._final_parallel_hidden(lane0, lane1))
+                    mudd_idx += 1
             else:
-                if skip_idx < self.num_skip_weights and skips:
+                if consume_skip:
                     scaled_skip = (
                         self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
                         * skips.pop()
@@ -1387,7 +1773,25 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
-                x = self.blocks[i](x, x0, q_w, k_w, v_w, out_w, up_w, down_w, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+                x = self.blocks[i](
+                    x, x0, q_w, k_w, v_w, out_w, up_w, down_w,
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, vm=vm,
+                    is_recurrent=is_recur, looping_active=looping_now,
+                )
+                if self.use_mudd:
+                    if mudd_idx % self.mudd_k_dilation == 0:
+                        hiddens.append(x)
+                    if mudd_idx in self.mudd_q_indices:
+                        dd = self.dynamic_dense[mudd_idx]
+                        vm = dd.layer_mix(x, hiddens, dd(x))
+                    else:
+                        vm = None
+                    mudd_idx += 1
+        if self.use_mudd and vm is not None:
+            # Records adds the final vm into the residual (line 309-310).
+            # 1-way (last_layer) returns a single tensor; multi-way returns a
+            # tuple — collapse to the last way (the "mlp_way") for the residual.
+            x = (vm[-1] if isinstance(vm, tuple) else vm) + x
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
@@ -1437,14 +1841,17 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips = []
+        # Mirror _forward_hidden's MUDD-aware iteration choice — the LoRA `slot`
+        # indexing also uses the looped order so it must match.
+        use_looped_iter = self.looping_active or self.use_mudd
         enc_iter = (
             self.encoder_indices
-            if self.looping_active
+            if use_looped_iter
             else list(range(self.num_encoder_layers))
         )
         dec_iter = (
             self.decoder_indices
-            if self.looping_active
+            if use_looped_iter
             else list(
                 range(
                     self.num_encoder_layers,
@@ -1452,22 +1859,67 @@ class GPT(nn.Module):
                 )
             )
         )
+        # MUDD bookkeeping for the TTT path — exactly mirrors _forward_hidden.
+        hiddens = []
+        vm = None
+        if self.use_mudd:
+            if self.mudd_emb is not None:
+                me = self.mudd_emb(input_ids)
+                edim = self.tok_emb.embedding_dim
+                for ei in range(self.num_mudd_embs):
+                    hiddens.append(F.rms_norm(
+                        me[:, :, ei * edim : (ei + 1) * edim], (edim,)
+                    ))
+            hiddens.append(x)
+        # Recurrent-skip mask, mirrored from _forward_hidden so train and TTT
+        # eval treat pre-loop recurrent positions identically.
+        if use_looped_iter:
+            recur_mask = self.is_recur_indices
+        else:
+            recur_mask = [False] * (len(enc_iter) + len(dec_iter))
+        looping_now = bool(self.looping_active)
+        # KEEP_UNET=0: see _forward_hidden for rationale.
+        keep_unet = self.skip_weights is not None
+        mudd_idx = 0
         slot = 0
-        for i in enc_iter:
+        for it_idx, i in enumerate(enc_iter):
+            is_recur = recur_mask[it_idx]
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
-            x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+            x = self._block_with_lora(
+                self.blocks[i], x, x0, lora, slot,
+                q_w, k_w, v_w, out_w, up_w, down_w, vm=vm,
+                is_recurrent=is_recur, looping_active=looping_now,
+            )
             slot += 1
-            skips.append(x)
+            if keep_unet:
+                skips.append(x)
+            if self.use_mudd:
+                if mudd_idx % self.mudd_k_dilation == 0:
+                    hiddens.append(x)
+                if mudd_idx in self.mudd_q_indices:
+                    dd = self.dynamic_dense[mudd_idx]
+                    vm = dd.layer_mix(x, hiddens, dd(x))
+                else:
+                    vm = None
+                mudd_idx += 1
         psl = self.parallel_start_layer
         lane0 = None
         lane1 = None
+        enc_len = len(enc_iter)
         for skip_idx, i in enumerate(dec_iter):
+            is_recur = recur_mask[enc_len + skip_idx]
+            consume_skip = (
+                skip_idx < self.num_skip_weights
+                and skips
+                and (not is_recur or looping_now)
+            )
             q_w, k_w, v_w, out_w, up_w, down_w = self._bank_weights(i)
             if i >= psl and psl > 0:
+                vm = None  # parallel lanes don't take vm — reset for safety
                 if lane0 is None:
                     lane0 = x
                     lane1 = x
-                if skip_idx < self.num_skip_weights and skips:
+                if consume_skip:
                     skip = skips.pop()
                     w = self.skip_weights[skip_idx].to(dtype=lane0.dtype)[None, None, :]
                     if self.skip_gates is not None:
@@ -1475,12 +1927,17 @@ class GPT(nn.Module):
                         lane0 = torch.lerp(w * skip, lane0, g)
                     else:
                         lane0 = lane0 + w * skip
-                lane0, lane1 = self._parallel_block_with_lora(
-                    i, lane0, lane1, x0, lora, slot,
-                    q_w, k_w, v_w, out_w, up_w, down_w,
-                )
+                if not (is_recur and not looping_now):
+                    lane0, lane1 = self._parallel_block_with_lora(
+                        i, lane0, lane1, x0, lora, slot,
+                        q_w, k_w, v_w, out_w, up_w, down_w,
+                    )
+                if self.use_mudd:
+                    if mudd_idx % self.mudd_k_dilation == 0:
+                        hiddens.append(self._final_parallel_hidden(lane0, lane1))
+                    mudd_idx += 1
             else:
-                if skip_idx < self.num_skip_weights and skips:
+                if consume_skip:
                     scaled_skip = (
                         self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :]
                         * skips.pop()
@@ -1490,8 +1947,23 @@ class GPT(nn.Module):
                         x = torch.lerp(scaled_skip, x, g)
                     else:
                         x = x + scaled_skip
-                x = self._block_with_lora(self.blocks[i], x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w)
+                x = self._block_with_lora(
+                    self.blocks[i], x, x0, lora, slot,
+                    q_w, k_w, v_w, out_w, up_w, down_w, vm=vm,
+                    is_recurrent=is_recur, looping_active=looping_now,
+                )
+                if self.use_mudd:
+                    if mudd_idx % self.mudd_k_dilation == 0:
+                        hiddens.append(x)
+                    if mudd_idx in self.mudd_q_indices:
+                        dd = self.dynamic_dense[mudd_idx]
+                        vm = dd.layer_mix(x, hiddens, dd(x))
+                    else:
+                        vm = None
+                    mudd_idx += 1
             slot += 1
+        if self.use_mudd and vm is not None:
+            x = (vm[-1] if isinstance(vm, tuple) else vm) + x
         if lane0 is not None:
             x = self._final_parallel_hidden(lane0, lane1)
         x = self.final_norm(x)
@@ -1506,20 +1978,59 @@ class GPT(nn.Module):
             logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none"
         ).reshape(bsz, sl)
 
-    def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w):
-        mix = block.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        n = block.attn_norm(x_in) * block.ln_scale_factor
+    def _block_with_lora(self, block, x, x0, lora, slot, q_w, k_w, v_w, out_w, up_w, down_w, vm=None, is_recurrent=False, looping_active=False):
+        # Mirror Block.forward's recurrent-skip semantics on the TTT path so
+        # train and TTT-eval both treat pre-loop recurrent positions as no-ops.
+        if is_recurrent and not looping_active:
+            return x
+        # KEEP_UNET=0: drop the x0 fold-in (matches Block.forward).
+        if block.resid_mix is None:
+            x_in = x
+        else:
+            mix = block.resid_mix.to(dtype=x.dtype)
+            x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        # MUDD `vm` semantics — must match Block.forward exactly so train and
+        # TTT eval see the same residual/qkv structure (PR-1797 alignment).
+        qkvway = None
+        if vm is not None:
+            if isinstance(vm, tuple):
+                qkvway = vm[:-1]
+                n = block.attn_norm(x_in) * block.ln_scale_factor
+                x_in = x_in + vm[-1]
+            else:
+                x_in = x_in + vm
+                n = block.attn_norm(x_in) * block.ln_scale_factor
+        else:
+            n = block.attn_norm(x_in) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
+        # Apply qkvway to the projection inputs BEFORE F.linear (and the LoRA
+        # tap, which sees the same shifted input — matches Block.forward).
+        if qkvway is None:
+            nq = nk = nv = n
+        else:
+            qkvn = len(qkvway)
+            if qkvn == 1:
+                nq, nk = n, n
+                nv = n + qkvway[0]
+            elif qkvn == 2:
+                nq = n + qkvway[0]
+                nk = n + qkvway[0]
+                nv = n + qkvway[1]
+            elif qkvn == 3:
+                nq = n + qkvway[0]
+                nk = n + qkvway[1]
+                nv = n + qkvway[2]
+            else:
+                raise ValueError(f"qkvway must have length 1, 2, or 3; got {qkvn}")
         # Keep raw Q for AttnOutGate src='q' (matches forward path semantics).
-        q_raw = F.linear(n, q_w.to(n.dtype)) + lora.q_loras[slot](n)
+        q_raw = F.linear(nq, q_w.to(n.dtype)) + lora.q_loras[slot](nq)
         q = q_raw.reshape(bsz, seqlen, attn.num_heads, attn.head_dim)
-        k = F.linear(n, k_w.to(n.dtype))
+        k = F.linear(nk, k_w.to(n.dtype))
         if lora.k_loras is not None:
-            k = k + lora.k_loras[slot](n)
+            k = k + lora.k_loras[slot](nk)
         k = k.reshape(bsz, seqlen, attn.num_kv_heads, attn.head_dim)
-        v = (F.linear(n, v_w.to(n.dtype)) + lora.v_loras[slot](n)).reshape(
+        v = (F.linear(nv, v_w.to(n.dtype)) + lora.v_loras[slot](nv)).reshape(
             bsz, seqlen, attn.num_kv_heads, attn.head_dim
         )
         q = F.rms_norm(q, (q.size(-1),))
@@ -1570,8 +2081,12 @@ class GPT(nn.Module):
         q_w, k_w, v_w, out_w, up_w, down_w,
     ):
         block = self.blocks[block_idx]
-        mix = block.resid_mix.to(dtype=lane0.dtype)
-        attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
+        # KEEP_UNET=0: drop the per-block x0 fold-in on the attention lane.
+        if block.resid_mix is None:
+            attn_read = lane0
+        else:
+            mix = block.resid_mix.to(dtype=lane0.dtype)
+            attn_read = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
         n = block.attn_norm(attn_read) * block.ln_scale_factor
         attn = block.attn
         bsz, seqlen, dim = n.shape
@@ -1888,7 +2403,10 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,attn_gate_w,smear_gate,smear_lambda",
+        # Note: `dynamic_dense` covers both MUDD w1.weight (matrix) and w2.weight
+        # (matrix) and the per-MUDD scale. They all route to the scalar AdamW
+        # group via Optimizers.__init__ (matching records semantics).
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,parallel_post_lambdas,parallel_resid_lambdas,attn_gate_proj,attn_gate_w,smear_gate,smear_lambda,dynamic_dense,mudd_scale",
     ).split(",")
     if pattern
 )
@@ -1912,7 +2430,7 @@ class Optimizers:
             if p.ndim < 2
             or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
-        if base_model.skip_weights.numel() > 0:
+        if base_model.skip_weights is not None and base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
         if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
             scalar_params.append(base_model.skip_gates)
@@ -1925,9 +2443,24 @@ class Optimizers:
         if getattr(base_model, "smear_gate_enabled", False):
             scalar_params.append(base_model.smear_gate.weight)
             scalar_params.append(base_model.smear_lambda)
+        # MUDD parameters. `dynamic_dense` lives on GPT root (ModuleList of
+        # MultiwayDynamicDenseBlock + None entries). Records routes ALL MUDD
+        # params (w1, w2 weights/biases, scale) through the scalar AdamW group;
+        # we mirror that exactly so the optimizer-state shapes don't shift.
+        if getattr(base_model, "use_mudd", False):
+            for blk in base_model.dynamic_dense:
+                if blk is None:
+                    continue
+                for p in blk.parameters():
+                    scalar_params.append(p)
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
+        # MUDD's optional extra embedding shares the token-embed AdamW group
+        # (same LR / wd as tok_emb — records does this verbatim).
+        tok_param_list = [base_model.tok_emb.weight]
+        if getattr(base_model, "mudd_emb", None) is not None:
+            tok_param_list.append(base_model.mudd_emb.weight)
         tok_params = [
-            {"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}
+            {"params": tok_param_list, "lr": token_lr, "base_lr": token_lr}
         ]
         self.optimizer_tok = torch.optim.AdamW(
             tok_params,
@@ -3337,6 +3870,20 @@ def train_model(h, device, val_data):
     )
     model = compiled_model
     log(f"model_params:{sum(p.numel()for p in base_model.parameters())}")
+    if getattr(base_model, "use_mudd", False):
+        log(
+            f"mudd:enabled q_indices={base_model.mudd_q_indices} "
+            f"q_dilation={base_model.mudd_q_dilation} k_dilation={base_model.mudd_k_dilation} "
+            f"num_ways={base_model.num_ways} mudd_emb={base_model.mudd_emb is not None} "
+            f"parallel_skip_iter={base_model._mudd_parallel_start_iter}"
+        )
+        for blk in base_model.dynamic_dense:
+            if blk is None:
+                continue
+            log(
+                f"  mudd[lidx={blk.lidx}] C={blk.C} L={blk.w2.weight.shape[0]//blk.C} "
+                f"local_window={blk.local_window_size} scale_init={blk.mudd_scale}"
+            )
     optimizers = Optimizers(h, base_model)
     train_loader = DocumentPackingLoader(h, device)
     max_wallclock_ms = (

@@ -123,12 +123,12 @@ PyTorch 2.9.1+cu128, CUDA 12.8, 8×H100 80GB SXM. lrzip system binary required (
 ## Reproducing
 
 ```bash
-DATA_DIR=./data \
+DATA_DIR=../data \
 VOCAB_SIZE=8192 \
-DATA_PATH=./data/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved \
-TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model \
+DATA_PATH=../data/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved \
+TOKENIZER_PATH=../data/tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model \
 CASEOPS_ENABLED=1 \
-ITERATIONS=20000 MAX_WALLCLOCK_SECONDS=600 \
+ITERATIONS=20000 MAX_WALLCLOCK_SECONDS=30 \
 PHASED_TTT_ENABLED=1 PHASED_TTT_PREFIX_DOCS=2500 PHASED_TTT_NUM_PHASES=3 \
 EMBED_BITS=7 MATRIX_LR=0.026 MIN_LR=0.1 \
 MLP_CLIP_SIGMAS=11.5 ATTN_CLIP_SIGMAS=13.0 EMBED_CLIP_SIGMAS=14.0 \
@@ -141,8 +141,8 @@ GATED_ATTN_QUANT_GATE=1 SPARSE_ATTN_GATE_ENABLED=1 GATE_WINDOW=12 \
 SMEAR_GATE_ENABLED=1 \
 LQER_ENABLED=1 LQER_ASYM_ENABLED=1 LQER_RANK=4 LQER_FACTOR_BITS=4 LQER_ASYM_GROUP=64 LQER_TOP_K=3 \
 FUSED_CE_ENABLED=1 COMPRESSOR=pergroup NCCL_NET=Socket \
-SEED=42 \
-torchrun --standalone --nproc_per_node=8 train_gpt.py
+SEED=42 USE_MUDD=1 KEEP_UNET=0 \
+torchrun --standalone --nproc_per_node=2 train_gpt.py
 ```
 
 ## Credits
