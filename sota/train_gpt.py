@@ -1412,10 +1412,10 @@ class GPT(nn.Module):
         self.parallel_final_lane = h.parallel_final_lane.lower()
         self.parallel_post_lambdas = nn.Parameter(
             torch.ones(h.num_layers, 2, 2, dtype=torch.float32)
-        )
+        ) if self.parallel_start_layer > 0 else None
         self.parallel_resid_lambdas = nn.Parameter(
             torch.full((h.num_layers, 2), 1.1, dtype=torch.float32)
-        )
+        ) if self.parallel_start_layer > 0 else None
         # SmearGate (PR #1667 / modded-nanogpt @classiclarryd):
         #   x_t <- x_t + lam * sigmoid(W * x_t[:gate_window]) * x_{t-1}.
         # Per-token forward-1 smear of the embedding lane. W zero-init + lam=0 ->
@@ -4074,7 +4074,7 @@ def train_model(h, device, val_data):
         if should_log_train:
             tok_per_sec = step * h.train_batch_tokens / (approx_training_time_ms / 1e3)
             log(
-                f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}"
+                f"{step}/{h.iterations} train_loss: {train_loss.item():.4f} step_avg:{approx_training_time_ms/step:.2f}ms train_time: {approx_training_time_ms/60000:.1f}m tok/s: {tok_per_sec:.0f}"
             )
         reached_cap = (
             max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
